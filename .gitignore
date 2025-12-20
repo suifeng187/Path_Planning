@@ -1,0 +1,23 @@
+# 忽略 Python 缓存
+__pycache__/
+*.py[cod]
+
+# 忽略 IDE 配置 (如果你用 VSCode 或 PyCharm)
+.vscode/
+.idea/
+
+# 忽略 训练日志 和 模型权重 (通常很大，不适合上传)
+logs/
+
+
+# 忽略 录制的视频
+video/
+*.mp4
+
+# 忽略 虚拟环境
+venv/
+env/
+.env
+
+# 忽略 MacOS 系统文件
+.DS_Store
