@@ -36,13 +36,13 @@ def get_train_cfg(exp_name, max_iterations):
             "entropy_coef": 0.015,  # v1: 0.01 从 0.01 提高到 0.015（增加探索，让所有无人机都能学习）
             "gamma": 0.99,
             "lam": 0.95,
-            "learning_rate": 0.0002,  # v1: 0.0005 从 0.0005 降到 0.0002（更稳定的学习，避免策略分化）
+            "learning_rate": 0.00015,  # v1: 0.0005 v2 : 0.00015 从 0.0005 降到 0.0002（更稳定的学习，避免策略分化）
             "max_grad_norm": 0.5,  # v1: 1.0 从 1.0 降到 0.5（更严格的梯度裁剪，提高稳定性）
             "num_learning_epochs": 4,  # v1: 4 从 4 提高到 5（每次更新更充分，提高学习效率）
             "num_mini_batches": 4,
             "schedule": "adaptive",
             "use_clipped_value_loss": True,
-            "value_loss_coef": 0.2,  # v1: 1.0 从 1.0 降到 0.5（降低价值函数损失的影响，解决loss过大的问题）
+            "value_loss_coef": 0.2,  # v1: 1.0 v2: 0.2  从 1.0 降到 0.5（降低价值函数损失的影响，解决loss过大的问题）
         },
         "init_member_classes": {},
         "policy": {
@@ -64,7 +64,8 @@ def get_train_cfg(exp_name, max_iterations):
             "run_name": "",
         },
         "runner_class_name": "OnPolicyRunner",
-        "num_steps_per_env": 100,
+        # 增大每个环境的轨迹长度，有助于学习中程行为（避障+绕行）
+        "num_steps_per_env": 100,  # v3: 100
         "save_interval": 100,
         "empirical_normalization": None,
         "seed": 1,
@@ -95,7 +96,7 @@ def get_cfgs():
             [1.0, 2.5, 0.8],
         ],
         "episode_length_s": 35.0,
-        "at_target_threshold": 0.5,
+        "at_target_threshold": 0.5,  # 减小判定半径，使无人机更接近目标点才算到达
         "simulate_action_latency": True,
         "clip_actions": 1.0,
         "visualize_target": False,
@@ -113,7 +114,7 @@ def get_cfgs():
         ],
         "obstacle_radius": 0.1,
         "obstacle_height": 2.5,
-        "obstacle_safe_distance": 0.3,
+        "obstacle_safe_distance": 0.3, # v2:0.2
         "obstacle_collision_distance": 0.1,
         "drone_safe_distance": 0.2,
         "drone_collision_distance": 0.1,
@@ -136,15 +137,16 @@ def get_cfgs():
     
     reward_cfg = {
         "reward_scales": {
-            "target": 75.0,  # v1: 50  从 50.0 提高到 80.0（更强调到达终点）
+            "target": 80.0,  # v1: 50  v2 : 80 从 50.0 提高到 80.0（更强调到达终点）
             "progress": 30.0,
             "alive": 3.0,
             "smooth": -1e-6,
             "crash": -10.0,  # v1: -5.0 从 -5.0 提高到 -8.0（更怕碰撞，强制学习避障）
-            "obstacle": -4.0,  # v1 : -1 从 -1 提高到 -3.0（更怕撞柱子，特别是最后一排）
-            "separation": -0.5,
-            # 新增：朝向目标直线飞行的奖励（鼓励走“直线+穿柱子”的路线）
-            "direction": 20.0, # v1:10 从 10.0 提高到 20.0（更强调直线飞行）
+            # 明显提高避障惩罚权重，鼓励提前绕开障碍物
+            "obstacle": -12.0,  # v1 : -1 v2: -3.5 v3: -7 -> -12
+            "separation": -0.1,
+            # 新增：朝向目标直线飞行的奖励（鼓励走"直线+穿柱子"的路线）
+            "direction": 25.0, # 从 20.0 降到 15.0（降低方向奖励，避免对左右无人机不利，它们需要横向移动避障）
         },
     }
     
@@ -263,7 +265,7 @@ if __name__ == "__main__":
 # PPO多无人机训练命令
 
 # 1. 新训练（无可视化，快速训练）
-python multi_drone_ppo_train.py -e multi-drone-ppo-v2 -B 4096 --max_iterations 800
+python multi_drone_ppo_train.py -e multi-drone-ppo-v4 -B 4096 --max_iterations 800
 
 # 2. 新训练（带可视化）
 python multi_drone_ppo_train.py -e multi-drone-ppo -B 64 --max_iterations 800 -v
@@ -272,8 +274,11 @@ python multi_drone_ppo_train.py -e multi-drone-ppo -B 64 --max_iterations 800 -v
 python multi_drone_ppo_train.py -e multi-drone-ppo -B 4096 --max_iterations 1000 --resume
 
 # 4. 从指定检查点恢复训练（微调）
-python multi_drone_ppo_train.py -e multi-drone-ppo-v2 -B 8192 --max_iterations 1000 --resume --ckpt 400
+python multi_drone_ppo_train.py -e multi-drone-ppo-v4 -B 8192 --max_iterations 1000 --resume --ckpt 400
 
 # 5. 微调训练（带可视化）
 python multi_drone_ppo_train.py -e multi-drone-ppo -B 64 --max_iterations 1000 --resume -v
+
+# 6. 微调（加载新配置）
+python multi_drone_ppo_train.py -e multi-drone-ppo -B 8192 --max_iterations 1000 --resume --ckpt 400 --update_config
 """

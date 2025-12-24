@@ -165,6 +165,7 @@ class MultiDronePPOEnv:
         # ==================== 初始化奖励函数 ====================
         self.reward_functions, self.episode_sums = dict(), dict()
         for name in self.reward_scales.keys():
+            # 所有 reward scale 都按 dt 缩放，保持每秒奖励量级稳定
             self.reward_scales[name] *= self.dt
             self.reward_functions[name] = getattr(self, "_reward_" + name)
             self.episode_sums[name] = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
@@ -188,6 +189,9 @@ class MultiDronePPOEnv:
         self.last_base_pos = torch.zeros_like(self.base_pos)
         self.rel_pos = torch.zeros_like(self.base_pos)
         self.last_rel_pos = torch.zeros_like(self.base_pos)
+
+        # 记录每架无人机是否曾经到达过目标点（用于支持"先后到达"的成功判定）
+        self.drone_ever_reached_target = torch.zeros((self.num_envs, self.num_drones), device=gs.device, dtype=torch.bool)
 
         self.extras = dict()
         self.extras["observations"] = dict()
@@ -238,10 +242,8 @@ class MultiDronePPOEnv:
         self.min_obstacle_dist = self._get_min_obstacle_distance()
         self.min_drone_dist = self._get_min_drone_distance()
 
-
         # ==================== 终止条件 ====================
         crash_any = torch.zeros((self.num_envs,), device=gs.device, dtype=torch.bool)
-        success_all = torch.ones((self.num_envs,), device=gs.device, dtype=torch.bool)
         
         for i in range(self.num_drones):
             drone_crash = (
@@ -252,15 +254,26 @@ class MultiDronePPOEnv:
             )
             crash_any = crash_any | drone_crash
             
+            # 检测当前帧是否到达目标点，并更新"曾经到达过"的记录
             drone_success = torch.norm(self.rel_pos[:, i, :], dim=1) < self.env_cfg["at_target_threshold"]
-            success_all = success_all & drone_success
+            # 一旦到达过目标点，就永久标记为"曾经到达过"（支持先后到达）
+            self.drone_ever_reached_target[:, i] = self.drone_ever_reached_target[:, i] | drone_success
 
         drone_collision = self.min_drone_dist < self.env_cfg.get("drone_collision_distance", 0.3)
         crash_any = crash_any | drone_collision
 
+        # 成功条件：所有无人机都曾经到达过目标点（支持先后到达，不需要同时到达）
+        # 统计每架无人机是否曾经到达过目标点
+        success_all = torch.all(self.drone_ever_reached_target, dim=1)  # (num_envs,)
+
         self.crash_condition = crash_any
         self.success_condition = success_all
-        self.reset_buf = (self.episode_length_buf > self.max_episode_length) | crash_any | success_all
+
+        # 时间终止：超过最大步数也结束一轮（视为失败但不算碰撞）
+        time_out = self.episode_length_buf >= self.max_episode_length
+
+        # 仅当发生碰撞、全部无人机都到达过目标点或超时时才结束本轮
+        self.reset_buf = crash_any | success_all | time_out
 
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).reshape((-1,)))
 
@@ -352,6 +365,8 @@ class MultiDronePPOEnv:
         self.last_actions[envs_idx] = 0.0
         self.episode_length_buf[envs_idx] = 0
         self.reset_buf[envs_idx] = True
+        # 重置"曾经到达过目标点"的记录
+        self.drone_ever_reached_target[envs_idx] = False
 
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
@@ -369,19 +384,30 @@ class MultiDronePPOEnv:
 
     # ==================== 奖励函数 ====================
     def _reward_target(self):
-        """目标奖励"""
+        """目标奖励：
+        - 强调“距离缩短”和“到达目标”的正向收益
+        - 减弱长期的距离惩罚，避免目标奖励整体长期为负
+        """
         target_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
         for i in range(self.num_drones):
             curr_dist = torch.norm(self.rel_pos[:, i, :], dim=1)
             last_dist = torch.norm(self.last_rel_pos[:, i, :], dim=1)
             dist_reduction = last_dist - curr_dist
-            target_rew += dist_reduction * 10.0
-            target_rew -= curr_dist * 0.1
-            target_rew += torch.where(curr_dist < 2.0, torch.ones_like(curr_dist) * 2.0, torch.zeros_like(curr_dist))
-            target_rew += torch.where(curr_dist < 1.0, torch.ones_like(curr_dist) * 5.0, torch.zeros_like(curr_dist))
+
+            # 奖励“靠近目标”的部分，适当限制单步奖励/惩罚幅度
+            target_rew += torch.clamp(dist_reduction * 15.0, min=-0.2, max=0.5)
+
+            # 仅保留一个较小的距离惩罚，防止长时间远离目标
+            target_rew -= torch.clamp(curr_dist * 0.02, max=0.3)
+
+            # 接近终点区域给予稳定正奖励，鼓励在终点附近保持稳定
+            near_mask = curr_dist < 1.0
+            target_rew[near_mask] += 1.0
+
+            # 真正到达终点给一次性大额奖励
             drone_at_target = curr_dist < self.env_cfg["at_target_threshold"]
-            target_rew[drone_at_target] += 80.0  # v1:50
-        target_rew[self.success_condition] += 500.0  # v1:300 从 300.0 提高到 500.0（更重视所有无人机都到达终点）
+            target_rew[drone_at_target] += 150.0  # v3:80
+        target_rew[self.success_condition] += 500.0  # v3：500
         return target_rew / self.num_drones
 
     def _reward_smooth(self):
@@ -393,13 +419,20 @@ class MultiDronePPOEnv:
         return crash_rew
 
     def _reward_obstacle(self):
+        """避障奖励：
+        - 在整个安全距离内进行线性惩罚，鼓励提前绕开障碍物
+        """
         obstacle_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
         if len(self.obstacles) == 0:
             return obstacle_rew
+
         for i in range(self.num_drones):
-            danger_dist = self.obstacle_safe_distance * 0.6
+            # 使用 obstacle_safe_distance 作为危险距离阈值
+            danger_dist = self.obstacle_safe_distance
             close_mask = self.min_obstacle_dist[:, i] < danger_dist
+            # 线性惩罚：越接近障碍物（距离接近 0），惩罚越大
             obstacle_rew[close_mask] -= (danger_dist - self.min_obstacle_dist[close_mask, i]) / danger_dist
+
         return obstacle_rew / self.num_drones
 
     def _reward_separation(self):
@@ -413,7 +446,16 @@ class MultiDronePPOEnv:
         progress_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
         for i in range(self.num_drones):
             y_progress = self.base_pos[:, i, 1] - self.last_base_pos[:, i, 1]
-            progress_rew += y_progress * 20.0
+
+            # 在远离障碍物时鼓励沿 y 轴前进；靠近障碍物时减弱前进奖励，避免一味“冲直线”
+            near_obs = self.min_obstacle_dist[:, i] < (self.obstacle_safe_distance * 1.2)
+            factor = torch.where(
+                near_obs,
+                torch.tensor(0.3, device=gs.device, dtype=gs.tc_float),
+                torch.tensor(1.0, device=gs.device, dtype=gs.tc_float),
+            )
+
+            progress_rew += y_progress * 20.0 * factor
             height = self.base_pos[:, i, 2]
             height_good = (height > 0.4) & (height < 1.5)
             progress_rew += torch.where(height_good, torch.ones_like(height) * 1.0, -torch.ones_like(height) * 0.5)
@@ -430,35 +472,40 @@ class MultiDronePPOEnv:
 
     def _reward_direction(self):
         """
-        朝向目标方向飞行的奖励：
-        - 鼓励沿“当前 → 目标”的直线方向前进（路径更短）
-        - 惩罚垂直于目标方向的“横向偏移”（减少绕远路）
-        实际上是在 xy 平面上做投影，适合从起点到终点之间“穿柱子”。
+        朝向各自目标点方向飞行的奖励：
+        - 鼓励每架无人机朝各自的目标点方向前进（缩短到目标点的距离）
+        - 主要奖励"朝向目标的前进"，允许必要的横向移动（用于避障）
         """
         # 只在水平面 (x, y) 上考虑方向
         dir_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
 
         for i in range(self.num_drones):
-            # 指向目标的向量（当前 → 目标）
-            rel_xy = self.rel_pos[:, i, :2]  # (B, 2)
+            # 指向目标的向量（当前 → 目标）- 每架无人机各自的目标点
+            rel_xy = self.rel_pos[:, i, :2]  # (B, 2) - 第i架无人机到其目标点的相对位置
             dist = torch.norm(rel_xy, dim=1) + 1e-6
-            unit_dir = rel_xy / dist.unsqueeze(-1)  # 单位方向
+            unit_dir = rel_xy / dist.unsqueeze(-1)  # 单位方向（指向各自目标点）
 
             # 本步真实位移（世界坐标）
             step_xy = (self.base_pos[:, i, :2] - self.last_base_pos[:, i, :2])
 
             # 沿目标方向的分量（投影）——越大越好
-            proj = torch.sum(step_xy * unit_dir, dim=1)  # (B,)
+            proj = torch.sum(step_xy * unit_dir, dim=1)  # (B,) - 朝向各自目标点的前进量
 
-            # 垂直于目标方向的“横向分量”——越小越好
+            # 垂直于目标方向的"横向分量"（用于避障，允许但不过度奖励）
             lateral = step_xy - proj.unsqueeze(-1) * unit_dir
             lateral_norm = torch.norm(lateral, dim=1)
 
-            # 组合奖励：
-            #   正向投影 * 系数  -  横向偏移 * 系数
-            #   并进行轻微截断，避免异常大步长带来数值不稳定
-            dir_rew += torch.clamp(proj * 8.0, min=0.0, max=0.1)  # 只奖励“朝向目标”的前进
-            dir_rew -= torch.clamp(lateral_norm * 4.0, min=0.0, max=0.1)
+            # 改进的奖励逻辑：
+            # 1. 强烈奖励"朝向目标的前进"（proj > 0）
+            # 2. 只在"没有朝向目标前进"时才轻微惩罚横向偏移（允许避障时的横向移动）
+            forward_reward = torch.clamp(proj * 10.0, min=0.0, max=0.15)  # 提高朝向目标前进的奖励
+            
+            # 只在没有前进或后退时才惩罚横向偏移（允许避障时的横向移动）
+            no_forward_mask = proj <= 0.0
+            lateral_penalty = torch.clamp(lateral_norm * 2.0, min=0.0, max=0.05)  # 降低横向惩罚
+            lateral_penalty = lateral_penalty * no_forward_mask.float()  # 只在没有前进时惩罚
+            
+            dir_rew += forward_reward - lateral_penalty
 
         # 对多架无人机取平均
         return dir_rew / self.num_drones
