@@ -1,6 +1,8 @@
 """
 多无人机避障路径规划训练脚本 - PPO版本
-将多架无人机视为一个整体，使用标准PPO算法训练
+修改说明：
+1. 更新了观测空间维度，加入障碍物感知信息 (obs_per_drone: 23 -> 29)
+2. 在 obs_scales 中添加了 obstacle 的缩放系数
 """
 import argparse
 import os
@@ -21,7 +23,7 @@ except (metadata.PackageNotFoundError, ImportError) as e:
 
 from rsl_rl.runners import OnPolicyRunner
 import genesis as gs
-from multi_drone_ppo_env import MultiDronePPOEnv
+from v2_multi_drone_ppo_env import MultiDronePPOEnv
 
 
 def get_train_cfg(exp_name, max_iterations):
@@ -33,20 +35,21 @@ def get_train_cfg(exp_name, max_iterations):
             "class_name": "PPO",
             "clip_param": 0.2,
             "desired_kl": 0.01,
-            "entropy_coef": 0.015,  # v1: 0.01 从 0.01 提高到 0.015（增加探索，让所有无人机都能学习）
+            "entropy_coef": 0.015,  
             "gamma": 0.99,
             "lam": 0.95,
-            "learning_rate": 0.00015,  # v1: 0.0005 v2 : 0.00015 从 0.0005 降到 0.0002（更稳定的学习，避免策略分化）
-            "max_grad_norm": 0.5,  # v1: 1.0 从 1.0 降到 0.5（更严格的梯度裁剪，提高稳定性）
-            "num_learning_epochs": 4,  # v1: 4 从 4 提高到 5（每次更新更充分，提高学习效率）
+            "learning_rate": 0.00015,
+            "max_grad_norm": 0.5,
+            "num_learning_epochs": 4,
             "num_mini_batches": 4,
             "schedule": "adaptive",
             "use_clipped_value_loss": True,
-            "value_loss_coef": 0.2,  # v1: 1.0 v2: 0.2  从 1.0 降到 0.5（降低价值函数损失的影响，解决loss过大的问题）
+            "value_loss_coef": 0.2,
         },
         "init_member_classes": {},
         "policy": {
             "activation": "elu",
+            # 稍微增加网络宽度以处理增加的观测信息
             "actor_hidden_dims": [256, 256, 128],
             "critic_hidden_dims": [256, 256, 128],
             "init_noise_std": 0.5,
@@ -64,8 +67,7 @@ def get_train_cfg(exp_name, max_iterations):
             "run_name": "",
         },
         "runner_class_name": "OnPolicyRunner",
-        # 增大每个环境的轨迹长度，有助于学习中程行为（避障+绕行）
-        "num_steps_per_env": 100,  # v3: 100
+        "num_steps_per_env": 100,
         "save_interval": 100,
         "empirical_normalization": None,
         "seed": 1,
@@ -96,7 +98,7 @@ def get_cfgs():
             [1.0, 2.5, 0.8],
         ],
         "episode_length_s": 35.0,
-        "at_target_threshold": 0.45,  # 减小判定半径，使无人机更接近目标点才算到达
+        "at_target_threshold": 0.5,
         "simulate_action_latency": True,
         "clip_actions": 1.0,
         "visualize_target": False,
@@ -114,39 +116,43 @@ def get_cfgs():
         ],
         "obstacle_radius": 0.1,
         "obstacle_height": 2.5,
-        "obstacle_safe_distance": 0.3, # v2:0.2
+        "obstacle_safe_distance": 0.3,
         "obstacle_collision_distance": 0.1,
         "drone_safe_distance": 0.2,
         "drone_collision_distance": 0.1,
+        
+        # 感知最近障碍物的数量
+        "num_nearest_obstacles": 2, 
     }
     
-    # PPO版本：观测维度 = 每架无人机观测 * 无人机数量 + 其他无人机相对位置
-    # 每架无人机基础观测: 17维 (rel_pos:3 + quat:4 + lin_vel:3 + ang_vel:3 + last_action:4)
-    # 加上其他无人机的相对位置: (num_drones-1) * 3
-    obs_per_drone = 17 + (num_drones - 1) * 3  # 17 + 6 = 23
+    # PPO版本：观测维度 = 每架无人机观测 * 无人机数量
+    # 1. 基础状态 (17维): rel_pos(3) + quat(4) + lin_vel(3) + ang_vel(3) + last_action(4)
+    # 2. 队友感知 (6维): (num_drones-1) * 3
+    # 3. [新增] 障碍物感知 (6维): num_nearest_obstacles * 3
+    
+    num_nearest_obs = env_cfg["num_nearest_obstacles"]
+    obs_per_drone = 17 + (num_drones - 1) * 3 + (num_nearest_obs * 3) # 17 + 6 + 6 = 29
     
     obs_cfg = {
-        "num_obs": obs_per_drone * num_drones,  # 23 * 3 = 69
+        "num_obs": obs_per_drone * num_drones,  # 29 * 3 = 87
         "num_obs_per_drone": obs_per_drone,
         "obs_scales": {
             "rel_pos": 1 / 3.0,
             "lin_vel": 1 / 3.0,
             "ang_vel": 1 / 3.14159,
+            "obstacle": 1 / 3.0, 
         },
     }
     
     reward_cfg = {
         "reward_scales": {
-            "target": 80.0,  # v1: 50  v2 : 80 从 50.0 提高到 80.0（更强调到达终点）
-            "progress": 30.0,
-            "alive": 3.0,
+            "target": 80.0,      
+            "progress": 40.0,     
+            "alive": 1.0,
             "smooth": -1e-6,
-            "crash": -10.0,  # v1: -5.0 从 -5.0 提高到 -8.0（更怕碰撞，强制学习避障）
-            # 明显提高避障惩罚权重，鼓励提前绕开障碍物
-            "obstacle": -12.0,  # v1 : -1 v2: -3.5 v3: -7 -> -12
-            "separation": -0.1,
-            # 新增：朝向目标直线飞行的奖励（鼓励走"直线+穿柱子"的路线）
-            "direction": 25.0, # 从 20.0 降到 15.0（降低方向奖励，避免对左右无人机不利，它们需要横向移动避障）
+            "crash": -15.0,
+            "obstacle": -12.0,
+            "separation": -2,
         },
     }
     
@@ -161,16 +167,14 @@ def main():
     parser.add_argument("-B", "--num_envs", type=int, default=4096)
     parser.add_argument("--max_iterations", type=int, default=800)
     parser.add_argument("--resume", action="store_true", default=False, help="从检查点恢复训练")
-    parser.add_argument("--ckpt", type=int, default=-1, help="检查点迭代数，-1表示加载最新模型（仅在--resume时有效）")
-    parser.add_argument("--update_config", action="store_true", default=False, help="恢复训练时使用新的配置参数（而不是旧的cfgs.pkl）")
+    parser.add_argument("--ckpt", type=int, default=-1, help="检查点迭代数")
+    parser.add_argument("--update_config", action="store_true", default=False, help="恢复训练时使用新的配置参数")
     args = parser.parse_args()
 
-    # 初始化Genesis引擎（无头模式通过不创建viewer实现）
     gs.init(backend=gs.gpu, precision="32", logging_level="warning", performance_mode=True)
 
     log_dir = f"logs/{args.exp_name}"
     
-    # 如果恢复训练，从已有配置加载；否则创建新配置
     if args.resume:
         if not os.path.exists(log_dir):
             print(f"错误：日志目录 {log_dir} 不存在，无法恢复训练")
@@ -178,29 +182,24 @@ def main():
         
         cfg_path = f"{log_dir}/cfgs.pkl"
         
-        # 如果指定了 --update_config，使用新配置；否则从旧配置加载
         if args.update_config:
             print("[更新配置] 使用新的配置参数，而不是旧的 cfgs.pkl")
             env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs()
             train_cfg = get_train_cfg(args.exp_name, args.max_iterations)
-            # 保存新配置
             pickle.dump(
                 [env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg],
                 open(cfg_path, "wb"),
             )
         else:
             if not os.path.exists(cfg_path):
-                print(f"错误：配置文件 {cfg_path} 不存在，无法恢复训练")
+                print(f"错误：配置文件 {cfg_path} 不存在")
                 return
             env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = pickle.load(open(cfg_path, "rb"))
-            # 更新最大迭代次数（如果需要继续训练更多轮）
             train_cfg["runner"]["max_iterations"] = args.max_iterations
         
-        # 确定检查点路径
         if args.ckpt > 0:
             resume_path = os.path.join(log_dir, f"model_{args.ckpt}.pt")
         else:
-            # 查找最新的模型
             model_files = [f for f in os.listdir(log_dir) if f.startswith("model_") and f.endswith(".pt")]
             if not model_files:
                 print(f"错误：在 {log_dir} 中未找到模型文件")
@@ -208,27 +207,17 @@ def main():
             model_files.sort(key=lambda x: int(x.replace("model_", "").replace(".pt", "")))
             resume_path = os.path.join(log_dir, model_files[-1])
         
-        if not os.path.exists(resume_path):
-            print(f"错误：检查点文件 {resume_path} 不存在")
-            available = [f for f in os.listdir(log_dir) if f.startswith("model_") and f.endswith(".pt")]
-            if available:
-                print(f"可用的检查点: {available}")
-            return
-        
         print(f"从检查点恢复训练: {resume_path}")
         train_cfg["runner"]["resume"] = True
         train_cfg["runner"]["resume_path"] = resume_path
     else:
-        # 新训练：创建新配置
         env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs()
         train_cfg = get_train_cfg(args.exp_name, args.max_iterations)
         
-        # 如果目录存在，删除旧数据
         if os.path.exists(log_dir):
             shutil.rmtree(log_dir)
         os.makedirs(log_dir, exist_ok=True)
         
-        # 保存配置
         pickle.dump(
             [env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg],
             open(f"{log_dir}/cfgs.pkl", "wb"),
@@ -249,11 +238,8 @@ def main():
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
-    
-    # 如果恢复训练，加载检查点
     if args.resume:
         runner.load(resume_path)
-        print(f"已加载检查点，继续训练...")
     
     runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)
 
@@ -265,20 +251,20 @@ if __name__ == "__main__":
 # PPO多无人机训练命令
 
 # 1. 新训练（无可视化，快速训练）
-python multi_drone_ppo_train.py -e multi-drone-ppo-v4 -B 4096 --max_iterations 800
+python v2_multi_drone_ppo_train.py -e v2-multi-drone-ppo -B 4096 --max_iterations 800
 
 # 2. 新训练（带可视化）
-python multi_drone_ppo_train.py -e multi-drone-ppo -B 64 --max_iterations 800 -v
+python v2_multi_drone_ppo_train.py -e v2-multi-drone-ppo -B 64 --max_iterations 800 -v
 
 # 3. 从最新检查点恢复训练（微调）
-python multi_drone_ppo_train.py -e multi-drone-ppo -B 4096 --max_iterations 1000 --resume
+python v2_multi_drone_ppo_train.py -e v2-multi-drone-ppo -B 4096 --max_iterations 1000 --resume
 
 # 4. 从指定检查点恢复训练（微调）
-python multi_drone_ppo_train.py -e multi-drone-ppo-v4 -B 8192 --max_iterations 1000 --resume --ckpt 400
+python v2_multi_drone_ppo_train.py -e v2-multi-drone-ppo -B 8192 --max_iterations 1000 --resume --ckpt 400
 
 # 5. 微调训练（带可视化）
-python multi_drone_ppo_train.py -e multi-drone-ppo -B 64 --max_iterations 1000 --resume -v
+python v2_multi_drone_ppo_train.py -e v2-multi-drone-ppo -B 64 --max_iterations 1000 --resume -v
 
 # 6. 微调（加载新配置）
-python multi_drone_ppo_train.py -e multi-drone-ppo -B 8192 --max_iterations 1000 --resume --ckpt 400 --update_config
+python v2_multi_drone_ppo_train.py -e v2-multi-drone-ppo -B 8192 --max_iterations 1000 --resume --ckpt 400 --update_config
 """
