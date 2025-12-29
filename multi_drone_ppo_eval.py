@@ -132,6 +132,8 @@ def main():
             print("提示：录制过程中，您可以随时在终端按 'Ctrl + C' 结束录制并保存视频。")
 
             env.cam.start_recording()
+            success_count = 0
+            completed_episodes = 0
             
             try:
                 for ep in range(args.episodes):
@@ -139,11 +141,21 @@ def main():
                     
                     for step in range(max_steps_per_episode):
                         actions = actor_critic.act_inference(obs)
+                        
+                        # 在调用step之前保存状态
+                        prev_reached = env.drone_ever_reached_target.clone() if hasattr(env, 'drone_ever_reached_target') else None
+                        success_now = env.success_condition.clone() if hasattr(env, 'success_condition') else torch.tensor([False])
+                        
                         obs, rews, dones, infos = env.step(actions)
                         env.cam.render()
                         
                         if dones.any():
-                            print(f"  Episode {ep+1}: Done at step {step}")
+                            # 检查是否成功
+                            all_reached = success_now.any().item()
+                            if all_reached:
+                                success_count += 1
+                            completed_episodes += 1
+                            print(f"  Episode {ep+1}: Done at step {step} {'[SUCCESS]' if all_reached else '[FAILED]'}")
                             break
             except KeyboardInterrupt:
                 print("\n\n[用户中断] 检测到 Ctrl+C，正在停止录制并保存视频...")
@@ -151,6 +163,18 @@ def main():
                 # 无论是否报错或手动中断，都会执行这里的保存逻辑
                 env.cam.stop_recording(save_to_filename=video_path, fps=60)
                 print(f"\nVideo saved to {video_path}")
+                
+                # 打印统计结果（如果有完成的episode）
+                if completed_episodes > 0:
+                    success_rate = (success_count / completed_episodes) * 100.0
+                    print("\n" + "="*50)
+                    print("录制统计结果")
+                    print("="*50)
+                    print(f"完成episode数: {completed_episodes}/{args.episodes}")
+                    print(f"成功次数: {success_count}")
+                    print(f"失败次数: {completed_episodes - success_count}")
+                    print(f"成功率: {success_rate:.2f}%")
+                    print("="*50)
         
         else:
             # 交互式评估 (无录制)
@@ -210,24 +234,44 @@ def main():
                             print(f"  判定阈值: {env.env_cfg['at_target_threshold']:.3f}m")
                         break
                 else:
-                    # Timeout情况
+                    # Timeout情况 - 也需要检查是否成功
                     final_distances = []
                     final_reached = []
                     for i in range(env.num_drones):
                         dist = torch.norm(env.rel_pos[0, i, :]).item()
                         final_distances.append(dist)
                         final_reached.append(env.drone_ever_reached_target[0, i].item())
+                    
+                    # 检查timeout时是否所有无人机都到达过目标点
+                    all_reached_timeout = all(final_reached)
+                    if all_reached_timeout:
+                        success_count += 1
+                    
                     print(f"Episode {ep+1}: Timeout (reward {episode_reward:.2f})")
                     print(f"  最终距离: [{final_distances[0]:.3f}, {final_distances[1]:.3f}, {final_distances[2]:.3f}]m")
                     print(f"  到达状态: [{final_reached[0]}, {final_reached[1]}, {final_reached[2]}]")
+                    if all_reached_timeout:
+                        print(f"  状态: SUCCESS - 所有无人机都曾经到达过目标点")
+                    else:
+                        print(f"  状态: FAILED - 未全部到达")
                     print(f"  判定阈值: {env.env_cfg['at_target_threshold']:.3f}m")
             
-            print(f"\nCompleted: {args.episodes} episodes")
+            # 打印最终统计结果
+            success_rate = (success_count / args.episodes) * 100.0
+            print("\n" + "="*50)
+            print("评估结果统计")
+            print("="*50)
+            print(f"总episode数: {args.episodes}")
+            print(f"成功次数: {success_count}")
+            print(f"失败次数: {args.episodes - success_count}")
+            print(f"成功率: {success_rate:.2f}%")
+            print("="*50)
 
 
 if __name__ == "__main__":
     main()
 
 # python multi_drone_ppo_eval.py -e multi-drone-ppo-v2 --ckpt 800
+# python multi_drone_ppo_eval.py -e multi-drone-ppo-v2 --ckpt 800 --episodes 20  # 运行20轮并统计成功率
 # python multi_drone_ppo_eval.py -e multi-drone-ppo --ckpt 799 --record
 # python multi_drone_ppo_eval.py -e multi-drone-ppo-v2 --ckpt 1400 --target_threshold 0.2  # 使用更严格的判定半径

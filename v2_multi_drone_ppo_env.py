@@ -1,10 +1,12 @@
 """
-多无人机避障路径规划环境 - PPO版本 (优化版)
-修改说明：
-1. Progress奖励：改为目标方向速度投影，解耦坐标系。
-2. Obstacle奖励：改为指数型势场惩罚。
-3. Direction奖励：避障时豁免侧向惩罚。
-4. Target奖励：移除阶梯函数，保持平滑。
+多无人机避障路径规划环境 - PPO版本 (Local Perception Final)
+1. 距离计算：依赖局部感知。
+   - 障碍物：水平距离 + sensing_radius过滤。
+   - 队友：3D距离 + sensing_radius过滤 + 每架独立计算。
+2. 观测空间：
+   - 队友：4维 [x, y, z, mask]，不可见时坐标置0且mask为0。
+   - 障碍物：Top-2，不可见或不足填充 1.0。
+3. 奖励函数：适配新的距离维度，集成智能侧向惩罚。
 """
 import torch
 import math
@@ -18,7 +20,7 @@ from genesis.utils.geom import (
 )
 
 class MultiDronePPOEnv:
-    """多无人机PPO环境 - 每架无人机可感知其他无人机 + 最近的障碍物"""
+    """多无人机PPO环境 - 局部感知版"""
 
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False):
         # ==================== 基础配置 ====================
@@ -41,6 +43,8 @@ class MultiDronePPOEnv:
         self.obs_scales = obs_cfg["obs_scales"]
         self.reward_scales = copy.deepcopy(reward_cfg["reward_scales"])
         
+        # 核心参数：感知半径和最近障碍物数量
+        self.sensing_radius = env_cfg.get("sensing_radius", 3.0)
         self.num_nearest_obstacles = env_cfg.get("num_nearest_obstacles", 2)
 
         # ==================== 创建仿真场景 ====================
@@ -82,7 +86,7 @@ class MultiDronePPOEnv:
         obstacle_radius = env_cfg.get("obstacle_radius", 0.12)
         obstacle_height = env_cfg.get("obstacle_height", 2.5)
         
-        # 保存障碍物坐标的Tensor，用于计算感知
+        # 保存障碍物坐标的Tensor
         self.obstacle_pos_tensor = torch.tensor(obstacle_positions, device=self.device, dtype=gs.tc_float) if obstacle_positions else torch.empty((0,3), device=self.device)
         
         for pos in obstacle_positions:
@@ -119,7 +123,6 @@ class MultiDronePPOEnv:
         self.drone_goal_positions = env_cfg.get("drone_goal_positions", [
             [-1.0, 2.5, 0.15], [0.0, 2.5, 0.15], [1.0, 2.5, 0.15],
         ])
-        # [新增] 将目标点转为 Tensor，用于并行计算奖励
         self.drone_goal_pos_tensor = torch.tensor(self.drone_goal_positions, device=self.device, dtype=gs.tc_float)
         
         drone_colors = [(1.0, 0.2, 0.2), (0.2, 1.0, 0.2), (0.2, 0.2, 1.0)]
@@ -184,9 +187,9 @@ class MultiDronePPOEnv:
 
         self.drone_ever_reached_target = torch.zeros((self.num_envs, self.num_drones), device=gs.device, dtype=torch.bool)
         
-        # 预先分配内存给 min_obstacle_dist，避免 step 中重复分配
+        # [修改] min_drone_dist 改为 (num_envs, num_drones)，每架独立
         self.min_obstacle_dist = torch.zeros((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float)
-        self.min_drone_dist = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
+        self.min_drone_dist = torch.zeros((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float)
 
         self.extras = dict()
         self.extras["observations"] = dict()
@@ -229,26 +232,30 @@ class MultiDronePPOEnv:
         self.last_rel_pos[:] = self.rel_pos[:]
         self.rel_pos = self.commands - self.base_pos
 
+        # 计算距离 (Local Only)
         self.min_obstacle_dist = self._get_min_obstacle_distance()
         self.min_drone_dist = self._get_min_drone_distance()
 
         # ==================== 终止条件 ====================
         crash_any = torch.zeros((self.num_envs,), device=gs.device, dtype=torch.bool)
         
+        # 机间碰撞检测 (适配新形状 (B, N))
+        drone_collision_per_drone = self.min_drone_dist < self.env_cfg.get("drone_collision_distance", 0.3)
+        drone_collision_any = drone_collision_per_drone.any(dim=1)
+        
         for i in range(self.num_drones):
             drone_crash = (
                 (torch.abs(self.base_euler[:, i, 1]) > self.env_cfg["termination_if_pitch_greater_than"])
                 | (torch.abs(self.base_euler[:, i, 0]) > self.env_cfg["termination_if_roll_greater_than"])
                 | (self.base_pos[:, i, 2] < self.env_cfg["termination_if_close_to_ground"])
-                | (self.min_obstacle_dist[:, i] < self.obstacle_collision_distance)
+                | (self.min_obstacle_dist[:, i] < self.obstacle_collision_distance) # 注意：如果是感知盲区，dist=100，这里不会触发crash
             )
             crash_any = crash_any | drone_crash
             
             drone_success = torch.norm(self.rel_pos[:, i, :], dim=1) < self.env_cfg["at_target_threshold"]
             self.drone_ever_reached_target[:, i] = self.drone_ever_reached_target[:, i] | drone_success
 
-        drone_collision = self.min_drone_dist < self.env_cfg.get("drone_collision_distance", 0.3)
-        crash_any = crash_any | drone_collision
+        crash_any = crash_any | drone_collision_any
 
         success_all = torch.all(self.drone_ever_reached_target, dim=1)
         self.crash_condition = crash_any
@@ -265,12 +272,13 @@ class MultiDronePPOEnv:
             self.rew_buf += rew
             self.episode_sums[name] += rew
 
-        # ==================== 构建观测 (含障碍物感知) ====================
+        # ==================== 构建观测 (Local + 4D Flag + Top-2) ====================
         obs_list = []
         has_obstacles = self.obstacle_pos_tensor.shape[0] > 0
+        sensing_radius = self.env_cfg.get("sensing_radius", 3.0)
         
         for i in range(self.num_drones):
-            # 1. 基础观测
+            # 1. 基础观测 (17维)
             base_obs = torch.cat([
                 torch.clip(self.rel_pos[:, i, :] * self.obs_scales["rel_pos"], -1, 1),
                 self.base_quat[:, i, :],
@@ -279,35 +287,64 @@ class MultiDronePPOEnv:
                 self.last_actions[:, i*4:(i+1)*4],
             ], dim=-1)
             
-            # 2. 队友感知
+            # 2. 队友感知 (4维: [x, y, z, mask])
             other_drones_rel_pos = []
             for j in range(self.num_drones):
                 if i != j:
-                    rel_to_other = (self.base_pos[:, j, :] - self.base_pos[:, i, :]) * self.obs_scales["rel_pos"]
-                    other_drones_rel_pos.append(torch.clip(rel_to_other, -1, 1))
+                    rel_vec = self.base_pos[:, j, :] - self.base_pos[:, i, :]
+                    dist = torch.norm(rel_vec, dim=1, keepdim=True)
+                    
+                    # 4维感知 Mask
+                    mask = (dist < sensing_radius).float()
+                    
+                    scaled_rel = torch.clip(rel_vec * self.obs_scales["rel_pos"], -1, 1)
+                    masked_rel = scaled_rel * mask
+                    
+                    # [x, y, z, mask]
+                    obs_with_flag = torch.cat([masked_rel, mask], dim=-1)
+                    other_drones_rel_pos.append(obs_with_flag)
             
-            # 3. 障碍物感知
-            nearest_obs_vecs = torch.zeros((self.num_envs, self.num_nearest_obstacles * 3), device=gs.device)
+            # 3. 障碍物感知 (3维 + Top-2)
+            # 默认填充值 1.0 (表示"安全/边界外")
+            nearest_obs_vecs = torch.ones((self.num_envs, self.num_nearest_obstacles * 3), device=gs.device)
+            
             if has_obstacles:
                 curr_drone_pos = self.base_pos[:, i, :]
-                vecs = self.obstacle_pos_tensor.unsqueeze(0) - curr_drone_pos.unsqueeze(1) # (B, M, 3)
-                dists = torch.norm(vecs, dim=-1) # (B, M)
                 
+                # 计算水平距离
+                obs_pos_expanded = self.obstacle_pos_tensor.unsqueeze(0).expand(self.num_envs, -1, -1).clone()
+                obs_pos_expanded[:, :, 2] = curr_drone_pos[:, 2].unsqueeze(1) 
+                vecs = obs_pos_expanded - curr_drone_pos.unsqueeze(1) 
+                dists = torch.norm(vecs, dim=-1) 
+                
+                # 局部感知筛选
+                out_of_range_mask = dists > sensing_radius
+                dists_masked = dists.clone()
+                dists_masked[out_of_range_mask] = float('inf')
+                
+                # Top-K
                 k = min(self.num_nearest_obstacles, self.obstacle_pos_tensor.shape[0])
-                _, indices = torch.topk(dists, k, dim=1, largest=False) # (B, k)
+                sorted_dists, indices = torch.topk(dists_masked, k, dim=1, largest=False)
                 
+                # 提取向量
                 indices_expanded = indices.unsqueeze(-1).expand(-1, -1, 3)
-                topk_vecs = torch.gather(vecs, 1, indices_expanded) # (B, k, 3)
-                
+                topk_vecs = torch.gather(vecs, 1, indices_expanded)
                 topk_vecs = topk_vecs * self.obs_scales["obstacle"]
                 topk_vecs = torch.clip(topk_vecs, -1, 1)
                 
-                flat_obs = topk_vecs.reshape(self.num_envs, -1)
+                # Mask有效性
+                valid_mask = (sorted_dists < sensing_radius).unsqueeze(-1).float()
+                
+                # 融合
+                final_vecs = topk_vecs * valid_mask + 1.0 * (1.0 - valid_mask)
+                flat_obs = final_vecs.reshape(self.num_envs, -1)
+                
                 if k < self.num_nearest_obstacles:
                     nearest_obs_vecs[:, :k*3] = flat_obs
                 else:
                     nearest_obs_vecs = flat_obs
 
+            # 拼接
             drone_obs = torch.cat([base_obs] + other_drones_rel_pos + [nearest_obs_vecs], dim=-1)
             obs_list.append(drone_obs)
         
@@ -318,23 +355,57 @@ class MultiDronePPOEnv:
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
 
     def _get_min_obstacle_distance(self):
+        """
+        [局部感知版] 计算最近障碍物距离
+        水平距离 (XY) + 局部感知过滤
+        """
         min_dist = torch.ones((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float) * 100.0
+        
         if len(self.obstacles) == 0:
             return min_dist
+            
+        radius = self.sensing_radius
+        
         for i in range(self.num_drones):
             drone_pos_xy = self.base_pos[:, i, :2]
+            
             for obs in self.obstacles:
                 obs_pos_xy = obs["pos"][:2].unsqueeze(0)
-                dist = torch.norm(drone_pos_xy - obs_pos_xy, dim=1) - obs["radius"]
-                min_dist[:, i] = torch.minimum(min_dist[:, i], dist)
+                
+                # 计算水平物理距离 (中心距离 - 半径)
+                dist_center = torch.norm(drone_pos_xy - obs_pos_xy, dim=1)
+                dist_surface = dist_center - obs["radius"]
+                
+                # 局部感知过滤
+                is_visible = dist_surface < radius
+                dist_filtered = torch.where(is_visible, dist_surface, torch.tensor(100.0, device=gs.device))
+                
+                min_dist[:, i] = torch.minimum(min_dist[:, i], dist_filtered)
+                
         return min_dist
 
     def _get_min_drone_distance(self):
-        min_dist = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_float) * 100.0
+        """
+        [局部感知版] 计算最近队友距离
+        3D距离 (XYZ) + 局部感知过滤 + 每架独立
+        """
+        min_dist = torch.ones((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float) * 100.0
+        radius = self.sensing_radius
+
         for i in range(self.num_drones):
-            for j in range(i + 1, self.num_drones):
-                dist = torch.norm(self.base_pos[:, i, :] - self.base_pos[:, j, :], dim=1)
-                min_dist = torch.minimum(min_dist, dist)
+            for j in range(self.num_drones):
+                if i == j:
+                    continue
+                
+                # 3D 距离
+                dist_3d = torch.norm(self.base_pos[:, i, :] - self.base_pos[:, j, :], dim=1)
+                
+                # 局部感知过滤
+                is_visible = dist_3d < radius
+                dist_filtered = torch.where(is_visible, dist_3d, torch.tensor(100.0, device=gs.device))
+                
+                min_dist[:, i] = torch.minimum(min_dist[:, i], dist_filtered)
+                
         return min_dist
 
     def get_observations(self):
@@ -365,7 +436,6 @@ class MultiDronePPOEnv:
         self.reset_buf[envs_idx] = True
         self.drone_ever_reached_target[envs_idx] = False
         
-        # 填充初始观测的占位符
         self.min_obstacle_dist[envs_idx] = 10.0
         self.min_drone_dist[envs_idx] = 10.0
 
@@ -383,32 +453,19 @@ class MultiDronePPOEnv:
         self.reset_idx(torch.arange(self.num_envs, device=gs.device))
         return self.obs_buf, None
 
-   # ==================== 优化的奖励函数====================
+    # ==================== 奖励函数 ====================
 
     def _reward_target(self):
-        """
-        [修改] 目标奖励 - 精简版
-        保留项：
-        1. 靠近target奖励 (通过 dist_reduction 实现)
-        2. 惩罚乱飞 (方向一致性检查)
-        3. 单机到达奖励 (Section 5)
-        4. 全员到达奖励 (Section 6)
-        5.
-        """
         target_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
         
         for i in range(self.num_drones):
             curr_dist = torch.norm(self.rel_pos[:, i, :], dim=1)
             last_dist = torch.norm(self.last_rel_pos[:, i, :], dim=1)
             
-            # --- 1. 靠近target奖励 (核心信号) ---
-            # 奖励距离缩短量，提供最基础的导航梯度
             dist_reduction = last_dist - curr_dist
-            target_rew += dist_reduction * 10.0 
-            # target_rew -= curr_dist * 0.2
+            target_rew += dist_reduction * 10
+            target_rew += torch.clamp(5 - curr_dist, min=-0.5) * 1.0
             
-            # --- 2. 惩罚乱飞 (方向一致性检查) ---
-            # 计算速度方向与目标方向的一致性
             to_target = self.drone_goal_pos_tensor[i] - self.base_pos[:, i, :]
             to_target_norm = torch.norm(to_target, dim=1, keepdim=True) + 1e-6
             target_dir = to_target / to_target_norm
@@ -417,164 +474,99 @@ class MultiDronePPOEnv:
             vel_norm = torch.norm(vel, dim=1, keepdim=True) + 1e-6
             vel_dir = vel / vel_norm
             
-            # 点积计算夹角余弦值
             direction_alignment = torch.sum(vel_dir * target_dir, dim=1)
             
-            # 避障豁免：只在远离障碍物时检查方向，避免避障时被误判为乱飞
             is_far_from_obstacle = self.min_obstacle_dist[:, i] > (self.obstacle_safe_distance * 2.0)
-            
-            # 如果方向严重偏离 (夹角 > 72度) 且周围安全，则惩罚
-            bad_direction = direction_alignment < 0.4 
+            bad_direction = direction_alignment < 0.3
             direction_penalty = torch.where(
                 is_far_from_obstacle & bad_direction,
-                torch.ones_like(direction_alignment) * 5.0, 
+                torch.ones_like(direction_alignment) * 3, 
                 torch.zeros_like(direction_alignment)
             )
             target_rew -= direction_penalty
             
-            # --- 3. 单机到达奖励 (原Section 5) ---
             drone_at_target = curr_dist < self.env_cfg["at_target_threshold"]
-            target_rew[drone_at_target] += 50.0 
-            
-            # --- 4. 所有无人机都到达的额外奖励 (原Section 6) ---
-            target_rew[self.success_condition] += 150.0 
+            target_rew[drone_at_target] += 5.0 
+            target_rew[self.success_condition] += 15.0 
         
         return target_rew / self.num_drones
 
     def _reward_smooth(self):
-        """
-        [保持] 动作平滑奖励
-        """
         return torch.sum(torch.square(self.actions - self.last_actions), dim=1)
 
     def _reward_crash(self):
-        """
-        [实现] 撞击障碍物或地面给予惩罚
-        注意：step中已经计算了 crash_condition (包含撞地、撞柱、姿态失控)
-        此处返回 1.0，配合 config 中的 crash scale (负值) 形成惩罚
-        """
         crash_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
         crash_rew[self.crash_condition] = 1.0
         return crash_rew
 
     def _reward_obstacle(self):
-        """
-        [实现] 线性避障惩罚
-        进入障碍物危险距离给予惩罚，越近惩罚越大 (线性)
-        """
         obstacle_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
         if len(self.obstacles) == 0:
             return obstacle_rew
 
         for i in range(self.num_drones):
             d = self.min_obstacle_dist[:, i]
-            safe_dist = self.obstacle_safe_distance # e.g. 0.25
-            
-            # 筛选出进入危险区域的
+            safe_dist = self.obstacle_safe_distance
             mask = d < safe_dist
-            
             if mask.any():
-                # 线性公式: (safe - current) / safe
-                # d=safe时为0，d=0时为1。配合 scale (负值) 形成惩罚。
                 obstacle_rew[mask] += (safe_dist - d[mask]) / safe_dist
 
         return obstacle_rew / self.num_drones
 
     def _reward_separation(self):
-        """
-        [实现] 无人机之间距离过近给予惩罚
-        """
-        sep_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
-        danger_dist = self.drone_safe_distance * 0.7
+        """适配 (B, N) 维度的分离奖励"""
+        # 初始化惩罚矩阵 (B, N)
+        sep_rew_per_drone = torch.zeros((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float)
+        danger_dist = self.drone_safe_distance
         
         close_mask = self.min_drone_dist < danger_dist
         if close_mask.any():
-             # 线性惩罚
-            sep_rew[close_mask] = (danger_dist - self.min_drone_dist[close_mask]) / danger_dist
-            
-        return sep_rew
+            sep_rew_per_drone[close_mask] = (danger_dist - self.min_drone_dist[close_mask]) / danger_dist
+        
+        # 对所有无人机求和
+        return torch.sum(sep_rew_per_drone, dim=1)
 
     def _reward_alive(self):
-        """
-        [保持] 存活奖励
-        """
         alive_rew = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_float)
         alive_rew[self.crash_condition] = 0.0
         return alive_rew
 
     def _reward_progress(self):
-        """
-        [优化后] 仅保留核心动力学奖励：
-        1. 推进奖励：速度在目标方向的投影 (vel_proj)
-        2. 侧向约束：惩罚侧向漂移，但在避障时豁免
-        3. 姿态约束：高度和倾角限制
-        """
-        progress_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
-        
+        dir_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
+
         for i in range(self.num_drones):
-            # --- 1. 计算目标方向向量 ---
-            to_target = self.drone_goal_pos_tensor[i] - self.base_pos[:, i, :]
-            dist = torch.norm(to_target, dim=1, keepdim=True) + 1e-6
-            target_dir = to_target / dist
+            rel_xy = self.rel_pos[:, i, :2] 
+            dist = torch.norm(rel_xy, dim=1) + 1e-6
+            unit_dir = rel_xy / dist.unsqueeze(-1) 
+
+            step_xy = (self.base_pos[:, i, :2] - self.last_base_pos[:, i, :2])
+            proj = torch.sum(step_xy * unit_dir, dim=1) 
+            lateral = step_xy - proj.unsqueeze(-1) * unit_dir
+            lateral_norm = torch.norm(lateral, dim=1)
+
+            forward_reward = torch.clamp(proj * 10.0, min=0.0, max=1) 
             
-            # --- 2. 分解当前速度 ---
-            vel = self.base_lin_vel[:, i, :]
-            
-            # [核心] 速度在目标方向上的投影 (Parallel Component)
-            # 这是一个标量：正值代表朝目标飞，负值代表背离
-            vel_proj = torch.sum(vel * target_dir, dim=1)
-            
-            # [核心] 计算侧向速度向量 (Lateral Component)
-            # 原始速度 - 平行分量 = 垂直分量 (漂移速度)
-            vel_lateral_vec = vel - vel_proj.unsqueeze(-1) * target_dir
-            vel_lateral_norm = torch.norm(vel_lateral_vec, dim=1)
-            
-            # --- 3. 检测障碍物距离（用于动态调整权重）---
             obstacle_dist = self.min_obstacle_dist[:, i]
             safe_dist = self.obstacle_safe_distance
+            lateral_penalty_base = torch.clamp(lateral_norm * 2.0, min=0.0, max=0.2)
             
-            # 定义两个阈值，形成缓冲区，避免硬切
-            is_far_from_obstacle = obstacle_dist > (safe_dist * 2.5)  # 绝对安全区
-            
-            # --- 4. 推进奖励 (Velocity Projection) ---
-            # 逻辑：只要速度朝向目标，就给奖励。
-            # 改进：加入 clamp 防止奖励爆炸 (例如限制最大奖励对应 3m/s)
-            base_progress = torch.clamp(vel_proj, max=3.0) * 0.8
-            enhanced_progress = torch.clamp(vel_proj, max=3.0) * 0.8
-            
-            # 在远离障碍物时，给予更高的速度权重，鼓励全速前进
-            progress_rew += torch.where(is_far_from_obstacle, enhanced_progress, base_progress)
-            
-            # --- 5. 智能侧向惩罚 (Smart Lateral Penalty) ---
-            # 逻辑：平时严禁横移，但避障时允许横移
-            lateral_penalty_base = vel_lateral_norm * 0.5
-            
-            # 计算过渡系数 (0.0 ~ 1.0)
-            # 距离: <0.5倍安全距离 -> 系数0 (完全豁免)
-            # 距离: >1.5倍安全距离 -> 系数1 (完全惩罚)
             transition_factor = torch.clamp(
                 (obstacle_dist - safe_dist * 0.5) / (safe_dist * 1.0), 
                 0.0, 1.0
             )
-            
-            # 应用过渡系数
             lateral_penalty = lateral_penalty_base * transition_factor
-            progress_rew -= lateral_penalty
             
-            # --- 6. 姿态与高度约束 (Constraints) ---
-            # 逻辑：只惩罚违规行为 (负约束)
+            dir_rew += forward_reward - lateral_penalty
+
             height = self.base_pos[:, i, 2]
-            
-            # 高度违规惩罚 (太低或太高)
-            height_bad = (height < 0.4) | (height > 1.2)
-            progress_rew -= torch.where(height_bad, torch.ones_like(height) * 3, torch.zeros_like(height))
+            h_min, h_max = 0.4, 1.2
+            low_penalty = torch.clamp(h_min - height, min=0.0)
+            high_penalty = torch.clamp(height - h_max, min=0.0)
+            dir_rew -= (low_penalty + high_penalty) * 0.5
         
-            # 姿态违规惩罚 (翻滚或俯仰角过大)
             roll = torch.abs(self.base_euler[:, i, 0])
             pitch = torch.abs(self.base_euler[:, i, 1])
             unstable = (roll > 60) | (pitch > 60)
-            progress_rew -= torch.where(unstable, torch.ones_like(roll) * 1.0, torch.zeros_like(roll))
-            
-        return progress_rew / self.num_drones
-    
-    
+            dir_rew -= torch.where(unstable, torch.ones_like(roll) * 0.1, torch.zeros_like(roll))
+
+        return dir_rew / self.num_drones

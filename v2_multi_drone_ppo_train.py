@@ -1,8 +1,5 @@
 """
-多无人机避障路径规划训练脚本 - PPO版本
-修改说明：
-1. 更新了观测空间维度，加入障碍物感知信息 (obs_per_drone: 23 -> 29)
-2. 在 obs_scales 中添加了 obstacle 的缩放系数
+多无人机避障路径规划训练脚本 - PPO版本 (Local Sensing + 4D Teammate + Top-2 Obstacle)
 """
 import argparse
 import os
@@ -27,15 +24,12 @@ from v2_multi_drone_ppo_env import MultiDronePPOEnv
 
 
 def get_train_cfg(exp_name, max_iterations):
-    """
-    获取PPO训练配置
-    """
     train_cfg_dict = {
         "algorithm": {
             "class_name": "PPO",
             "clip_param": 0.2,
             "desired_kl": 0.01,
-            "entropy_coef": 0.015,  
+            "entropy_coef": 0.015,
             "gamma": 0.99,
             "lam": 0.95,
             "learning_rate": 0.00015,
@@ -49,7 +43,6 @@ def get_train_cfg(exp_name, max_iterations):
         "init_member_classes": {},
         "policy": {
             "activation": "elu",
-            # 稍微增加网络宽度以处理增加的观测信息
             "actor_hidden_dims": [256, 256, 128],
             "critic_hidden_dims": [256, 256, 128],
             "init_noise_std": 0.5,
@@ -83,7 +76,7 @@ def get_cfgs():
     
     env_cfg = {
         "num_drones": num_drones,
-        "num_actions": 4,  # 每架无人机4个电机
+        "num_actions": 4,
         "termination_if_roll_greater_than": 80,
         "termination_if_pitch_greater_than": 80,
         "termination_if_close_to_ground": 0.02,
@@ -104,14 +97,20 @@ def get_cfgs():
         "visualize_target": False,
         "visualize_camera": False,
         "max_visualize_FPS": 60,
+        
+        # === 感知配置 (核心修改) ===
+        "sensing_radius": 3.0,          # 局部感知半径 3米
+        "num_nearest_obstacles": 2,     # 只关注最近的2个障碍物
+        # =========================
+
         "obstacle_positions": [
-            # 第1排（y=-1.5）：6个柱子，间距0.9
+            # 第1排
             [-2.25, -1.5, 1.0], [-1.35, -1.5, 1.0], [-0.45, -1.5, 1.0], [0.45, -1.5, 1.0], [1.35, -1.5, 1.0], [2.25, -1.5, 1.0],
-            # 第2排（y=-0.5）：5个柱子，间距0.9，插空排列
+            # 第2排
             [-1.8, -0.5, 1.0], [-0.9, -0.5, 1.0], [0.0, -0.5, 1.0], [0.9, -0.5, 1.0], [1.8, -0.5, 1.0],
-            # 第3排（y=0.5）：6个柱子，同第1排
+            # 第3排
             [-2.25,  0.5, 1.0], [-1.35,  0.5, 1.0], [-0.45, 0.5, 1.0], [0.45, 0.5, 1.0], [1.35, 0.5, 1.0], [2.25, 0.5, 1.0],
-            # 第4排（y=1.5）：5个柱子，同第2排
+            # 第4排
             [-1.8,  1.5, 1.0], [-0.9, 1.5, 1.0], [0.0, 1.5, 1.0], [0.9, 1.5, 1.0], [1.8, 1.5, 1.0],
         ],
         "obstacle_radius": 0.1,
@@ -120,21 +119,19 @@ def get_cfgs():
         "obstacle_collision_distance": 0.1,
         "drone_safe_distance": 0.2,
         "drone_collision_distance": 0.1,
-        
-        # 感知最近障碍物的数量
-        "num_nearest_obstacles": 2, 
     }
     
-    # PPO版本：观测维度 = 每架无人机观测 * 无人机数量
-    # 1. 基础状态 (17维): rel_pos(3) + quat(4) + lin_vel(3) + ang_vel(3) + last_action(4)
-    # 2. 队友感知 (6维): (num_drones-1) * 3
-    # 3. [新增] 障碍物感知 (6维): num_nearest_obstacles * 3
-    
+    # === 观测维度计算 (核心修改) ===
     num_nearest_obs = env_cfg["num_nearest_obstacles"]
-    obs_per_drone = 17 + (num_drones - 1) * 3 + (num_nearest_obs * 3) # 17 + 6 + 6 = 29
+    
+    # 1. 基础状态 (17维)
+    # 2. 队友感知 (4维): [rel_x, rel_y, rel_z, visibility_mask] * (num_drones - 1)
+    # 3. 障碍物感知 (3维): [rel_x, rel_y, rel_z] * num_nearest_obs
+    
+    obs_per_drone = 17 + (num_drones - 1) * 4 + (num_nearest_obs * 3)
     
     obs_cfg = {
-        "num_obs": obs_per_drone * num_drones,  # 29 * 3 = 87
+        "num_obs": obs_per_drone * num_drones,
         "num_obs_per_drone": obs_per_drone,
         "obs_scales": {
             "rel_pos": 1 / 3.0,
@@ -146,8 +143,8 @@ def get_cfgs():
     
     reward_cfg = {
         "reward_scales": {
-            "target": 80.0,      
-            "progress": 40.0,     
+            "target": 50.0,      
+            "progress": 30.0,     
             "alive": 1.0,
             "smooth": -1e-6,
             "crash": -15.0,
@@ -166,9 +163,9 @@ def main():
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     parser.add_argument("-B", "--num_envs", type=int, default=4096)
     parser.add_argument("--max_iterations", type=int, default=800)
-    parser.add_argument("--resume", action="store_true", default=False, help="从检查点恢复训练")
-    parser.add_argument("--ckpt", type=int, default=-1, help="检查点迭代数")
-    parser.add_argument("--update_config", action="store_true", default=False, help="恢复训练时使用新的配置参数")
+    parser.add_argument("--resume", action="store_true", default=False)
+    parser.add_argument("--ckpt", type=int, default=-1)
+    parser.add_argument("--update_config", action="store_true", default=False)
     args = parser.parse_args()
 
     gs.init(backend=gs.gpu, precision="32", logging_level="warning", performance_mode=True)
@@ -183,7 +180,7 @@ def main():
         cfg_path = f"{log_dir}/cfgs.pkl"
         
         if args.update_config:
-            print("[更新配置] 使用新的配置参数，而不是旧的 cfgs.pkl")
+            print("[更新配置] 使用新的配置参数")
             env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs()
             train_cfg = get_train_cfg(args.exp_name, args.max_iterations)
             pickle.dump(
@@ -226,7 +223,6 @@ def main():
     if args.vis:
         env_cfg["visualize_target"] = True
         args.num_envs = min(args.num_envs, 128)
-        print(f"[Visualization Mode] Reduced num_envs to {args.num_envs}")
 
     env = MultiDronePPOEnv(
         num_envs=args.num_envs,
@@ -251,7 +247,7 @@ if __name__ == "__main__":
 # PPO多无人机训练命令
 
 # 1. 新训练（无可视化，快速训练）
-python v2_multi_drone_ppo_train.py -e v2-multi-drone-ppo -B 4096 --max_iterations 800
+python v2_multi_drone_ppo_train.py -e v2-multi-drone-ppo-v2 -B 4096 --max_iterations 800
 
 # 2. 新训练（带可视化）
 python v2_multi_drone_ppo_train.py -e v2-multi-drone-ppo -B 64 --max_iterations 800 -v
