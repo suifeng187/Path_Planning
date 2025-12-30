@@ -460,30 +460,14 @@ class MultiDronePPOEnv:
         
         for i in range(self.num_drones):
             curr_dist = torch.norm(self.rel_pos[:, i, :], dim=1)
-            last_dist = torch.norm(self.last_rel_pos[:, i, :], dim=1)
             
-            dist_reduction = last_dist - curr_dist
-            target_rew += dist_reduction * 10
-            target_rew += torch.clamp(5 - curr_dist, min=-0.5) * 1.0
+            curr_dist_sq = torch.sum(torch.square(self.rel_pos[:, i, :]), dim=1)
+            last_dist_sq = torch.sum(torch.square(self.last_rel_pos[:, i, :]), dim=1)
             
-            to_target = self.drone_goal_pos_tensor[i] - self.base_pos[:, i, :]
-            to_target_norm = torch.norm(to_target, dim=1, keepdim=True) + 1e-6
-            target_dir = to_target / to_target_norm
-            
-            vel = self.base_lin_vel[:, i, :]
-            vel_norm = torch.norm(vel, dim=1, keepdim=True) + 1e-6
-            vel_dir = vel / vel_norm
-            
-            direction_alignment = torch.sum(vel_dir * target_dir, dim=1)
-            
-            is_far_from_obstacle = self.min_obstacle_dist[:, i] > (self.obstacle_safe_distance * 2.0)
-            bad_direction = direction_alignment < 0.3
-            direction_penalty = torch.where(
-                is_far_from_obstacle & bad_direction,
-                torch.ones_like(direction_alignment) * 3, 
-                torch.zeros_like(direction_alignment)
-            )
-            target_rew -= direction_penalty
+            dist_reduction = last_dist_sq - curr_dist_sq
+            target_rew += dist_reduction 
+        
+            target_rew += torch.clamp(5 - curr_dist, min=0) * 0.05
             
             drone_at_target = curr_dist < self.env_cfg["at_target_threshold"]
             target_rew[drone_at_target] += 5.0 
@@ -514,17 +498,18 @@ class MultiDronePPOEnv:
         return obstacle_rew / self.num_drones
 
     def _reward_separation(self):
-        """适配 (B, N) 维度的分离奖励"""
         # 初始化惩罚矩阵 (B, N)
         sep_rew_per_drone = torch.zeros((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float)
         danger_dist = self.drone_safe_distance
         
+        # 找出距离过近的无人机
         close_mask = self.min_drone_dist < danger_dist
         if close_mask.any():
+            # 计算归一化惩罚 (0.0 ~ 1.0)
             sep_rew_per_drone[close_mask] = (danger_dist - self.min_drone_dist[close_mask]) / danger_dist
         
-        # 对所有无人机求和
-        return torch.sum(sep_rew_per_drone, dim=1)
+        # 对所有无人机求平均值，而不是求和
+        return torch.mean(sep_rew_per_drone, dim=1)
 
     def _reward_alive(self):
         alive_rew = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_float)
@@ -532,41 +517,59 @@ class MultiDronePPOEnv:
         return alive_rew
 
     def _reward_progress(self):
+        """
+        [修改版] 仅作为侧向惩罚 (Lateral Penalty Only)
+        1. 移除 forward_reward：不再重复奖励向目标移动的行为（由 _reward_target 负责）。
+        2. 保留 Smart Lateral Penalty：平时约束走直线，遇障时允许侧向避障。
+        """
+        # 初始化奖励累加器
+        # 注意：这里改名为 penalty_sum 可能更贴切，但为了保持变量名一致性暂不修改
         dir_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
 
         for i in range(self.num_drones):
+            # 计算当前位置到目标的单位方向向量
             rel_xy = self.rel_pos[:, i, :2] 
             dist = torch.norm(rel_xy, dim=1) + 1e-6
             unit_dir = rel_xy / dist.unsqueeze(-1) 
 
+            # 计算这一步的位移向量
             step_xy = (self.base_pos[:, i, :2] - self.last_base_pos[:, i, :2])
+            
+            # 分解位移：投影分量(proj) 和 侧向分量(lateral)
             proj = torch.sum(step_xy * unit_dir, dim=1) 
             lateral = step_xy - proj.unsqueeze(-1) * unit_dir
             lateral_norm = torch.norm(lateral, dim=1)
 
-            forward_reward = torch.clamp(proj * 10.0, min=0.0, max=1) 
-            
             obstacle_dist = self.min_obstacle_dist[:, i]
             safe_dist = self.obstacle_safe_distance
+            
+            # 基础惩罚：侧向移动越大约大 (上限 0.2)
             lateral_penalty_base = torch.clamp(lateral_norm * 2.0, min=0.0, max=0.2)
             
+            # 过渡因子：离障碍物越远，因子越接近1 (惩罚越重)；离障碍物越近，因子越接近0 (允许侧移)
             transition_factor = torch.clamp(
                 (obstacle_dist - safe_dist * 0.5) / (safe_dist * 1.0), 
                 0.0, 1.0
             )
+            
             lateral_penalty = lateral_penalty_base * transition_factor
             
-            dir_rew += forward_reward - lateral_penalty
-
-            height = self.base_pos[:, i, 2]
-            h_min, h_max = 0.4, 1.2
-            low_penalty = torch.clamp(h_min - height, min=0.0)
-            high_penalty = torch.clamp(height - h_max, min=0.0)
-            dir_rew -= (low_penalty + high_penalty) * 0.5
-        
-            roll = torch.abs(self.base_euler[:, i, 0])
-            pitch = torch.abs(self.base_euler[:, i, 1])
-            unstable = (roll > 60) | (pitch > 60)
-            dir_rew -= torch.where(unstable, torch.ones_like(roll) * 0.1, torch.zeros_like(roll))
+            # 5. 累加：只减去侧向惩罚
+            dir_rew += lateral_penalty
 
         return dir_rew / self.num_drones
+
+        #增加一个多无人机速度的方差惩罚
+    # def _reward_variance(self):
+    #     """
+    #     [新增奖励] 多无人机速度方差惩罚
+    #     惩罚速度不一致，防止有的无人机偷懒。
+    #     返回：速度的方差 (正值)
+    #     """
+    #     # 计算每架无人机的线速度模长 (num_envs, num_drones)
+    #     drone_speeds = torch.norm(self.base_lin_vel, dim=-1)
+        
+    #     # 计算速度方差 (num_envs,)
+    #     vel_var = torch.var(drone_speeds, dim=1)
+        
+    #     return vel_var

@@ -143,13 +143,14 @@ def get_cfgs():
     
     reward_cfg = {
         "reward_scales": {
-            "target": 50.0,      
-            "progress": 30.0,     
-            "alive": 1.0,
-            "smooth": -1e-6,
-            "crash": -15.0,
-            "obstacle": -12.0,
-            "separation": -2,
+            "target": 20.0,      
+            "progress": -5.0,     
+            "alive": 0.01,
+            "smooth": -0.01,
+            "crash": -15,
+            "obstacle": -5,
+            "separation": -1,
+            #"variance": -0.01,
         },
     }
     

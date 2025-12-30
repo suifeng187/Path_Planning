@@ -203,7 +203,7 @@ def main():
                             print(f"  最终距离: [{final_distances[0]:.3f}, {final_distances[1]:.3f}, {final_distances[2]:.3f}]m")
                             print(f"  到达状态: [{final_reached[0]}, {final_reached[1]}, {final_reached[2]}] - 未全部到达")
                             print(f"  结束原因: crash={crash_now.any().item()}, success_flag={success_now.any().item()}")
-                            print(f"  最小机间距: {min_drone_dist.item():.3f}m  | 最低高度: {min_alt:.3f}m")
+                            print(f"  最小机间距: {min_drone_dist.min().item():.3f}m  | 最低高度: {min_alt:.3f}m")
                             # 打印各无人机与障碍物的最小距离，便于确认是否撞柱
                             obs_dists_str = ", ".join([f"{min_obs_dist[0, i].item():.3f}" for i in range(env.num_drones)])
                             print(f"  最小障碍距离: [{obs_dists_str}]m")
