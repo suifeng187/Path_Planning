@@ -29,7 +29,7 @@ def get_train_cfg(exp_name, max_iterations):
             "class_name": "PPO",
             "clip_param": 0.2,
             "desired_kl": 0.01,
-            "entropy_coef": 0.015,
+            "entropy_coef": 0.01,
             "gamma": 0.99,
             "lam": 0.95,
             "learning_rate": 0.00015,
@@ -77,8 +77,8 @@ def get_cfgs():
     env_cfg = {
         "num_drones": num_drones,
         "num_actions": 4,
-        "termination_if_roll_greater_than": 80,
-        "termination_if_pitch_greater_than": 80,
+        "termination_if_roll_greater_than": 60,
+        "termination_if_pitch_greater_than": 60,
         "termination_if_close_to_ground": 0.02,
         "drone_init_positions": [
             [-1.0, -2.5, 0.8],
@@ -91,7 +91,7 @@ def get_cfgs():
             [1.0, 2.5, 0.8],
         ],
         "episode_length_s": 35.0,
-        "at_target_threshold": 0.5,
+        "at_target_threshold": 0.4,
         "simulate_action_latency": True,
         "clip_actions": 1.0,
         "visualize_target": False,
@@ -142,15 +142,17 @@ def get_cfgs():
     }
     
     reward_cfg = {
+        "yaw_lambda": -10.0,
         "reward_scales": {
             "target": 20.0,      
-            "progress": -5.0,     
+            "progress": 1,     
             "alive": 0.01,
-            "smooth": -0.01,
+            "smooth": -1e-3,
+            "yaw": 0.5,
+            "angular": -0.05,
             "crash": -15,
             "obstacle": -5,
             "separation": -1,
-            #"variance": -0.01,
         },
     }
     

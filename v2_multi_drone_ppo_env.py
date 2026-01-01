@@ -6,7 +6,6 @@
 2. 观测空间：
    - 队友：4维 [x, y, z, mask]，不可见时坐标置0且mask为0。
    - 障碍物：Top-2，不可见或不足填充 1.0。
-3. 奖励函数：适配新的距离维度，集成智能侧向惩罚。
 """
 import torch
 import math
@@ -207,7 +206,7 @@ class MultiDronePPOEnv:
             start_idx = i * self.num_actions_per_drone
             end_idx = start_idx + self.num_actions_per_drone
             drone_actions = self.actions[:, start_idx:end_idx]
-            drone.set_propellels_rpm((1 + drone_actions * 0.8) * 14468.429183500699)
+            drone.set_propellels_rpm((1 + drone_actions * 0.4) * 14468.429183500699)
 
         self.scene.step()
         self.episode_length_buf += 1
@@ -355,10 +354,6 @@ class MultiDronePPOEnv:
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
 
     def _get_min_obstacle_distance(self):
-        """
-        [局部感知版] 计算最近障碍物距离
-        水平距离 (XY) + 局部感知过滤
-        """
         min_dist = torch.ones((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float) * 100.0
         
         if len(self.obstacles) == 0:
@@ -372,11 +367,9 @@ class MultiDronePPOEnv:
             for obs in self.obstacles:
                 obs_pos_xy = obs["pos"][:2].unsqueeze(0)
                 
-                # 计算水平物理距离 (中心距离 - 半径)
                 dist_center = torch.norm(drone_pos_xy - obs_pos_xy, dim=1)
                 dist_surface = dist_center - obs["radius"]
-                
-                # 局部感知过滤
+              
                 is_visible = dist_surface < radius
                 dist_filtered = torch.where(is_visible, dist_surface, torch.tensor(100.0, device=gs.device))
                 
@@ -385,10 +378,6 @@ class MultiDronePPOEnv:
         return min_dist
 
     def _get_min_drone_distance(self):
-        """
-        [局部感知版] 计算最近队友距离
-        3D距离 (XYZ) + 局部感知过滤 + 每架独立
-        """
         min_dist = torch.ones((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float) * 100.0
         radius = self.sensing_radius
 
@@ -397,10 +386,8 @@ class MultiDronePPOEnv:
                 if i == j:
                     continue
                 
-                # 3D 距离
                 dist_3d = torch.norm(self.base_pos[:, i, :] - self.base_pos[:, j, :], dim=1)
                 
-                # 局部感知过滤
                 is_visible = dist_3d < radius
                 dist_filtered = torch.where(is_visible, dist_3d, torch.tensor(100.0, device=gs.device))
                 
@@ -454,20 +441,21 @@ class MultiDronePPOEnv:
         return self.obs_buf, None
 
     # ==================== 奖励函数 ====================
-
+    # 速度略快，降低引导；直线引导再增加；速度设置一下上限
     def _reward_target(self):
         target_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
         
         for i in range(self.num_drones):
+            
+            #curr_dist_sq = torch.sum(torch.square(self.rel_pos[:, i, :]), dim=1)
+            #last_dist_sq = torch.sum(torch.square(self.last_rel_pos[:, i, :]), dim=1)
             curr_dist = torch.norm(self.rel_pos[:, i, :], dim=1)
+            last_dist = torch.norm(self.last_rel_pos[:, i, :], dim=1)
             
-            curr_dist_sq = torch.sum(torch.square(self.rel_pos[:, i, :]), dim=1)
-            last_dist_sq = torch.sum(torch.square(self.last_rel_pos[:, i, :]), dim=1)
-            
-            dist_reduction = last_dist_sq - curr_dist_sq
+            dist_reduction = last_dist - curr_dist
             target_rew += dist_reduction 
         
-            target_rew += torch.clamp(5 - curr_dist, min=0) * 0.05
+            #target_rew += torch.clamp(5 - curr_dist, min=0) * 0.05
             
             drone_at_target = curr_dist < self.env_cfg["at_target_threshold"]
             target_rew[drone_at_target] += 5.0 
@@ -477,6 +465,16 @@ class MultiDronePPOEnv:
 
     def _reward_smooth(self):
         return torch.sum(torch.square(self.actions - self.last_actions), dim=1)
+
+    def _reward_yaw(self):
+        yaw = self.base_euler[:, :, 2]  # (num_envs, num_drones)
+        yaw = torch.where(yaw > 180, yaw - 360, yaw) / 180 * 3.14159  # use rad for yaw_reward
+        yaw_rew = torch.exp(self.reward_cfg["yaw_lambda"] * torch.abs(yaw))
+        return torch.mean(yaw_rew, dim=1)  # 对所有无人机求平均，返回 (num_envs,)
+
+    def _reward_angular(self):
+        angular_rew = torch.norm(self.base_ang_vel / 3.14159, dim=2)  # (num_envs, num_drones)
+        return torch.mean(angular_rew, dim=1)  # 对所有无人机求平均，返回 (num_envs,)
 
     def _reward_crash(self):
         crash_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
@@ -498,17 +496,14 @@ class MultiDronePPOEnv:
         return obstacle_rew / self.num_drones
 
     def _reward_separation(self):
-        # 初始化惩罚矩阵 (B, N)
         sep_rew_per_drone = torch.zeros((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float)
         danger_dist = self.drone_safe_distance
         
-        # 找出距离过近的无人机
         close_mask = self.min_drone_dist < danger_dist
         if close_mask.any():
             # 计算归一化惩罚 (0.0 ~ 1.0)
             sep_rew_per_drone[close_mask] = (danger_dist - self.min_drone_dist[close_mask]) / danger_dist
         
-        # 对所有无人机求平均值，而不是求和
         return torch.mean(sep_rew_per_drone, dim=1)
 
     def _reward_alive(self):
@@ -518,58 +513,30 @@ class MultiDronePPOEnv:
 
     def _reward_progress(self):
         """
-        [修改版] 仅作为侧向惩罚 (Lateral Penalty Only)
-        1. 移除 forward_reward：不再重复奖励向目标移动的行为（由 _reward_target 负责）。
-        2. 保留 Smart Lateral Penalty：平时约束走直线，遇障时允许侧向避障。
+        Alignment Reward
+        计算“当前速度方向”与“目标方向”的余弦相似度。
+        范围：[-1.0, 1.0]
         """
-        # 初始化奖励累加器
-        # 注意：这里改名为 penalty_sum 可能更贴切，但为了保持变量名一致性暂不修改
-        dir_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
+        alignment_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
 
         for i in range(self.num_drones):
-            # 计算当前位置到目标的单位方向向量
-            rel_xy = self.rel_pos[:, i, :2] 
-            dist = torch.norm(rel_xy, dim=1) + 1e-6
-            unit_dir = rel_xy / dist.unsqueeze(-1) 
+            # self.rel_pos 已经是 (Goal - Pos)
+            target_vec = self.rel_pos[:, i, :] 
+            # 归一化 (添加极小值防止除以0)
+            target_dir = target_vec / (torch.norm(target_vec, dim=1, keepdim=True) + 1e-6)
 
-            # 计算这一步的位移向量
-            step_xy = (self.base_pos[:, i, :2] - self.last_base_pos[:, i, :2])
+            vel_vec = self.base_lin_vel[:, i, :]
+            speed = torch.norm(vel_vec, dim=1, keepdim=True)
+            # 归一化
+            vel_dir = vel_vec / (speed + 1e-6)
+            dot_prod = torch.sum(target_dir * vel_dir, dim=1)
             
-            # 分解位移：投影分量(proj) 和 侧向分量(lateral)
-            proj = torch.sum(step_xy * unit_dir, dim=1) 
-            lateral = step_xy - proj.unsqueeze(-1) * unit_dir
-            lateral_norm = torch.norm(lateral, dim=1)
+            # 如果速度非常小(接近悬停)，方向可能是噪声，可以将奖励置为0
+            mask_static = speed.squeeze(-1) < 0.05
+            dot_prod[mask_static] = 0.0
 
-            obstacle_dist = self.min_obstacle_dist[:, i]
-            safe_dist = self.obstacle_safe_distance
-            
-            # 基础惩罚：侧向移动越大约大 (上限 0.2)
-            lateral_penalty_base = torch.clamp(lateral_norm * 2.0, min=0.0, max=0.2)
-            
-            # 过渡因子：离障碍物越远，因子越接近1 (惩罚越重)；离障碍物越近，因子越接近0 (允许侧移)
-            transition_factor = torch.clamp(
-                (obstacle_dist - safe_dist * 0.5) / (safe_dist * 1.0), 
-                0.0, 1.0
-            )
-            
-            lateral_penalty = lateral_penalty_base * transition_factor
-            
-            # 5. 累加：只减去侧向惩罚
-            dir_rew += lateral_penalty
+            alignment_rew += dot_prod
 
-        return dir_rew / self.num_drones
+        return alignment_rew / self.num_drones
 
-        #增加一个多无人机速度的方差惩罚
-    # def _reward_variance(self):
-    #     """
-    #     [新增奖励] 多无人机速度方差惩罚
-    #     惩罚速度不一致，防止有的无人机偷懒。
-    #     返回：速度的方差 (正值)
-    #     """
-    #     # 计算每架无人机的线速度模长 (num_envs, num_drones)
-    #     drone_speeds = torch.norm(self.base_lin_vel, dim=-1)
         
-    #     # 计算速度方差 (num_envs,)
-    #     vel_var = torch.var(drone_speeds, dim=1)
-        
-    #     return vel_var
