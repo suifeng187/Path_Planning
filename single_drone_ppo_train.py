@@ -1,13 +1,11 @@
-"""
-单无人机避障路径规划训练脚本 - PPO版本
-"""
 import argparse
 import os
 import pickle
 import shutil
+import math
 from importlib import metadata
 
-# 检查rsl-rl-lib版本
+# ... (Imports check logic remains the same) ...
 try:
     try:
         if metadata.version("rsl-rl"):
@@ -20,10 +18,9 @@ except (metadata.PackageNotFoundError, ImportError) as e:
 
 from rsl_rl.runners import OnPolicyRunner
 import genesis as gs
-# 注意：这里导入的是修改后的 SingleDronePPOEnv
 from single_drone_ppo_env import SingleDronePPOEnv
 
-
+# ... (get_train_cfg remains the same) ...
 def get_train_cfg(exp_name, max_iterations):
     train_cfg_dict = {
         "algorithm": {
@@ -68,28 +65,51 @@ def get_train_cfg(exp_name, max_iterations):
     }
     return train_cfg_dict
 
+def generate_circular_obstacles(max_radius=2.5, obstacle_radius=0.12, spacing=0.9):
+    """生成障碍物阵列"""
+    obstacles = []
+    start_radius = 0.8 
+    current_radius = start_radius
+    while current_radius <= max_radius:
+        circumference = 2 * math.pi * current_radius
+        num_obs_in_ring = int(circumference / spacing)
+        for i in range(num_obs_in_ring):
+            angle = 2 * math.pi * i / num_obs_in_ring
+            x = current_radius * math.cos(angle)
+            y = current_radius * math.sin(angle)
+            obstacles.append([x, y, 1.0])
+        current_radius += spacing * 0.9 
+    return obstacles
 
 def get_cfgs():
-    """
-    获取环境配置
-    """
-    # === 修改：设置为单无人机 ===
     num_drones = 1
     
+    # === 修改 1: 扩大障碍物范围，增加两圈左右 (2.8 -> 4.5) ===
+    arena_radius = 3.5
+    obstacle_pos_list = generate_circular_obstacles(
+        max_radius=arena_radius, 
+        obstacle_radius=0.1, 
+        spacing=0.8
+    )
+
     env_cfg = {
         "num_drones": num_drones,
         "num_actions": 4,
         "termination_if_roll_greater_than": 60,
         "termination_if_pitch_greater_than": 60,
         "termination_if_close_to_ground": 0.02,
-        # === 修改：只保留中间的初始点和目标点 ===
-        "drone_init_positions": [
-            [0.0, -2.5, 0.8],
-        ],
-        "drone_goal_positions": [
-            [0.0, 2.5, 0.8],
-        ],
-        "episode_length_s": 35.0,
+        
+        "drone_init_positions": [[0.0, 0.0, 0.8]], 
+        "drone_goal_positions": [[2.0, 0.0, 0.8]], 
+
+        # === 修改 2: 目标生成参数调整 ===
+        "arena_radius": arena_radius, # 传入这个参数，让目标生成在这个半径内
+        "goal_height": 0.8,
+        
+        # 悬停参数
+        "hover_duration_s": 0.5, # 悬停时间
+
+        "episode_length_s": 40.0, # 增加一点时间，因为要悬停
         "at_target_threshold": 0.4,
         "simulate_action_latency": True,
         "clip_actions": 1.0,
@@ -100,32 +120,14 @@ def get_cfgs():
         "sensing_radius": 3.0,          
         "num_nearest_obstacles": 2,     
 
-        "obstacle_positions": [
-            # 第1排
-            [-2.25, -1.5, 1.0], [-1.35, -1.5, 1.0], [-0.45, -1.5, 1.0], [0.45, -1.5, 1.0], [1.35, -1.5, 1.0], [2.25, -1.5, 1.0],
-            # 第2排
-            [-1.8, -0.5, 1.0], [-0.9, -0.5, 1.0], [0.0, -0.5, 1.0], [0.9, -0.5, 1.0], [1.8, -0.5, 1.0],
-            # 第3排
-            [-2.25,  0.5, 1.0], [-1.35,  0.5, 1.0], [-0.45, 0.5, 1.0], [0.45, 0.5, 1.0], [1.35, 0.5, 1.0], [2.25, 0.5, 1.0],
-            # 第4排
-            [-1.8,  1.5, 1.0], [-0.9, 1.5, 1.0], [0.0, 1.5, 1.0], [0.9, 1.5, 1.0], [1.8, 1.5, 1.0],
-        ],
+        "obstacle_positions": obstacle_pos_list,
         "obstacle_radius": 0.1,
-        "obstacle_height": 2.5,
+        "obstacle_height": 1.6,
         "obstacle_safe_distance": 0.3,
         "obstacle_collision_distance": 0.1,
-        "drone_safe_distance": 0.2,
-        # "drone_collision_distance": 0.1, # 单无人机不需要这个
     }
     
-    # === 观测维度计算 (核心修改) ===
-    num_nearest_obs = env_cfg["num_nearest_obstacles"]
-    
-    # 1. 基础状态 (17维)
-    # 2. 障碍物感知 (3维): [rel_x, rel_y, rel_z] * num_nearest_obs
-    # 3. 移除了队友感知
-    
-    obs_per_drone = 17 + (num_nearest_obs * 3)
+    obs_per_drone = 17 + (env_cfg["num_nearest_obstacles"] * 3)
     
     obs_cfg = {
         "num_obs": obs_per_drone * num_drones,
@@ -141,28 +143,28 @@ def get_cfgs():
     reward_cfg = {
         "yaw_lambda": -10.0,
         "reward_scales": {
-            "target": 20.0,      
-            "progress": 1,     
-            "alive": 0.01,
+            "target": 20.0,
+            "progress": 1.5,     
+            "alive": 0.1,
             "smooth": -1e-3,
             "yaw": 0.5,
             "angular": -0.05,
-            "crash": -15,
-            "obstacle": -5,
-            # "separation": -1, # 移除机间避障奖励
+            "crash": -20.0,
+            "obstacle": -5.0,
+            # 注意：成功到达的奖励会在 env.step 中处理
         },
     }
     
     command_cfg = {"num_commands": 3}
     return env_cfg, obs_cfg, reward_cfg, command_cfg
 
-
+# ... (main function remains the same) ...
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-e", "--exp_name", type=str, default="single-drone-ppo") # 建议修改默认实验名
+    parser.add_argument("-e", "--exp_name", type=str, default="single-drone-hover-nav") # 建议改个名
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     parser.add_argument("-B", "--num_envs", type=int, default=4096)
-    parser.add_argument("--max_iterations", type=int, default=800)
+    parser.add_argument("--max_iterations", type=int, default=1500) # 任务变难了，增加训练步数
     parser.add_argument("--resume", action="store_true", default=False)
     parser.add_argument("--ckpt", type=int, default=-1)
     parser.add_argument("--update_config", action="store_true", default=False)
@@ -224,7 +226,6 @@ def main():
         env_cfg["visualize_target"] = True
         args.num_envs = min(args.num_envs, 128)
 
-    # 实例化单无人机环境
     env = SingleDronePPOEnv(
         num_envs=args.num_envs,
         env_cfg=env_cfg,
@@ -248,7 +249,7 @@ if __name__ == "__main__":
 # PPO单无人机训练命令
 
 # 1. 新训练（无可视化，快速训练）
-python single_drone_ppo_train.py -e single-drone-ppo -B 4096 --max_iterations 800
+python single_drone_ppo_train.py -e single-drone-ppo-v2 -B 4096 --max_iterations 800
 
 # 2. 新训练（带可视化）
 python single_drone_ppo_train.py -e single-drone-ppo -B 64 --max_iterations 800 -v
