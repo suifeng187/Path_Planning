@@ -1,11 +1,9 @@
 """
-多无人机避障路径规划环境 - PPO版本 (Local Perception Final)
-1. 距离计算：依赖局部感知。
-   - 障碍物：水平距离 + sensing_radius过滤。
-   - 队友：3D距离 + sensing_radius过滤 + 每架独立计算。
-2. 观测空间：
-   - 队友：4维 [x, y, z, mask]，不可见时坐标置0且mask为0。
-   - 障碍物：Top-2，不可见或不足填充 1.0。
+多无人机避障路径规划环境 - MAPPO版本 (CTDE架构 - 修正版)
+修改记录：
+1. Critic观测：严格的 Global State (固定顺序 [Drone1, Drone2, ...])。
+2. Actor观测：移除相对速度，保留基础感知。
+3. Reward：引入 Team Reward 混合机制。
 """
 import torch
 import math
@@ -18,21 +16,25 @@ from genesis.utils.geom import (
     transform_quat_by_quat,
 )
 
-class MultiDronePPOEnv:
-    """多无人机PPO环境 - 局部感知版"""
+class MultiDroneMAPPOEnv:
+    """多无人机MAPPO环境 - 集中训练分散执行"""
 
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False):
         # ==================== 基础配置 ====================
-        self.num_envs = num_envs
+        self.num_physical_envs = num_envs
         self.num_drones = env_cfg.get("num_drones", 3)
-        self.rendered_env_num = min(5, self.num_envs)
+        self.num_envs = self.num_physical_envs * self.num_drones 
+        self.rendered_env_num = min(5, self.num_physical_envs)
         
-        self.num_obs_per_drone = obs_cfg["num_obs_per_drone"]
-        self.num_obs = obs_cfg["num_obs"]
-        self.num_actions_per_drone = env_cfg["num_actions"]
-        self.num_actions = self.num_actions_per_drone * self.num_drones
+        # 观测维度配置
+        self.num_obs_per_drone = obs_cfg["num_obs_per_drone"] # Actor 输入维度
+        self.num_obs = self.num_obs_per_drone
+        
+        # 特权观测维度 (Critic 输入)
+        self.num_privileged_obs = self.num_obs_per_drone * self.num_drones
+        
+        self.num_actions = env_cfg["num_actions"]
         self.device = gs.device
-
         self.dt = 0.01
         self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.dt)
 
@@ -42,7 +44,9 @@ class MultiDronePPOEnv:
         self.obs_scales = obs_cfg["obs_scales"]
         self.reward_scales = copy.deepcopy(reward_cfg["reward_scales"])
         
-        # 核心参数：感知半径和最近障碍物数量
+        # [NEW] 团队奖励系数 (0.0: 完全自私, 1.0: 完全平均)
+        self.team_spirit = env_cfg.get("team_spirit", 0.3) 
+        
         self.sensing_radius = env_cfg.get("sensing_radius", 3.0)
         self.num_nearest_obstacles = env_cfg.get("num_nearest_obstacles", 2)
 
@@ -85,7 +89,6 @@ class MultiDronePPOEnv:
         obstacle_radius = env_cfg.get("obstacle_radius", 0.12)
         obstacle_height = env_cfg.get("obstacle_height", 2.5)
         
-        # 保存障碍物坐标的Tensor
         self.obstacle_pos_tensor = torch.tensor(obstacle_positions, device=self.device, dtype=gs.tc_float) if obstacle_positions else torch.empty((0,3), device=self.device)
         
         for pos in obstacle_positions:
@@ -132,7 +135,6 @@ class MultiDronePPOEnv:
             drone = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/cf2x.urdf"))
             self.drones.append(drone)
 
-        # 目标点可视化
         if env_cfg.get("visualize_target", False):
             for i, goal_pos in enumerate(self.drone_goal_positions):
                 self.scene.add_entity(
@@ -156,385 +158,369 @@ class MultiDronePPOEnv:
         else:
             self.cam = None
 
-        self.scene.build(n_envs=num_envs)
+        self.scene.build(n_envs=self.num_physical_envs)
 
-        # ==================== 初始化奖励函数 ====================
+        # ==================== 初始化 ====================
         self.reward_functions, self.episode_sums = dict(), dict()
         for name in self.reward_scales.keys():
             self.reward_scales[name] *= self.dt
             self.reward_functions[name] = getattr(self, "_reward_" + name)
             self.episode_sums[name] = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
 
-        # ==================== 初始化状态缓冲区 ====================
         self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=gs.device, dtype=gs.tc_float)
+        self.privileged_obs_buf = torch.zeros((self.num_envs, self.num_privileged_obs), device=gs.device, dtype=gs.tc_float)
         self.rew_buf = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
         self.reset_buf = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_int)
         self.episode_length_buf = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_int)
         
-        self.commands = torch.zeros((self.num_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
-        self.actions = torch.zeros((self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float)
-        self.last_actions = torch.zeros_like(self.actions)
+        self.commands = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
+        
+        self.last_actions_phys = torch.zeros((self.num_physical_envs, self.num_drones, self.num_actions), device=gs.device, dtype=gs.tc_float)
+        self.prev_actions_phys = torch.zeros_like(self.last_actions_phys)
 
-        self.base_pos = torch.zeros((self.num_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
-        self.base_quat = torch.zeros((self.num_envs, self.num_drones, 4), device=gs.device, dtype=gs.tc_float)
-        self.base_lin_vel = torch.zeros((self.num_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
-        self.base_ang_vel = torch.zeros((self.num_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
-        self.base_euler = torch.zeros((self.num_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
+        self.base_pos = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
+        self.base_quat = torch.zeros((self.num_physical_envs, self.num_drones, 4), device=gs.device, dtype=gs.tc_float)
+        self.base_lin_vel = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
+        self.base_ang_vel = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
+        self.base_euler = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
+        
         self.last_base_pos = torch.zeros_like(self.base_pos)
         self.rel_pos = torch.zeros_like(self.base_pos)
         self.last_rel_pos = torch.zeros_like(self.base_pos)
 
-        self.drone_ever_reached_target = torch.zeros((self.num_envs, self.num_drones), device=gs.device, dtype=torch.bool)
-        
-        # [修改] min_drone_dist 改为 (num_envs, num_drones)，每架独立
-        self.min_obstacle_dist = torch.zeros((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float)
-        self.min_drone_dist = torch.zeros((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float)
+        self.drone_ever_reached_target = torch.zeros((self.num_physical_envs, self.num_drones), device=gs.device, dtype=torch.bool)
+        self.min_obstacle_dist = torch.zeros((self.num_physical_envs, self.num_drones), device=gs.device, dtype=gs.tc_float)
+        self.min_drone_dist = torch.zeros((self.num_physical_envs, self.num_drones), device=gs.device, dtype=gs.tc_float)
+        self.phys_crash_cond = torch.zeros((self.num_physical_envs,), device=gs.device, dtype=torch.bool)
+        self.phys_success_cond = torch.zeros((self.num_physical_envs,), device=gs.device, dtype=torch.bool)
 
         self.extras = dict()
         self.extras["observations"] = dict()
 
-    def _resample_commands(self, envs_idx):
+    def _resample_commands(self, physical_envs_idx):
         for i, goal_pos in enumerate(self.drone_goal_positions):
-            self.commands[envs_idx, i, 0] = goal_pos[0]
-            self.commands[envs_idx, i, 1] = goal_pos[1]
-            self.commands[envs_idx, i, 2] = goal_pos[2]
+            self.commands[physical_envs_idx, i, 0] = goal_pos[0]
+            self.commands[physical_envs_idx, i, 1] = goal_pos[1]
+            self.commands[physical_envs_idx, i, 2] = goal_pos[2]
 
     def step(self, actions):
-        self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        # 0. 清理上一帧的 extras
+        self.extras = {}
         
+        # 1. 动作处理
+        actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        phys_actions = actions.view(self.num_physical_envs, self.num_drones, self.num_actions)
+        
+        self.prev_actions_phys[:] = self.last_actions_phys[:]
+        self.last_actions_phys[:] = phys_actions[:] 
+        
+        # 2. 物理步进
         for i, drone in enumerate(self.drones):
-            start_idx = i * self.num_actions_per_drone
-            end_idx = start_idx + self.num_actions_per_drone
-            drone_actions = self.actions[:, start_idx:end_idx]
+            drone_actions = phys_actions[:, i, :]
             drone.set_propellels_rpm((1 + drone_actions * 0.4) * 14468.429183500699)
 
         self.scene.step()
         self.episode_length_buf += 1
 
+        # 3. 更新状态
         self.last_base_pos[:] = self.base_pos[:]
         for i, drone in enumerate(self.drones):
             self.base_pos[:, i, :] = drone.get_pos()
             self.base_quat[:, i, :] = drone.get_quat()
-            
             self.base_euler[:, i, :] = quat_to_xyz(
                 transform_quat_by_quat(
-                    self.inv_base_init_quat.unsqueeze(0).expand(self.num_envs, -1),
+                    self.inv_base_init_quat.unsqueeze(0).expand(self.num_physical_envs, -1),
                     self.base_quat[:, i, :],
-                ),
-                rpy=True, degrees=True,
+                ), rpy=True, degrees=True,
             )
-            
             inv_quat_i = inv_quat(self.base_quat[:, i, :])
             self.base_lin_vel[:, i, :] = transform_by_quat(drone.get_vel(), inv_quat_i)
             self.base_ang_vel[:, i, :] = transform_by_quat(drone.get_ang(), inv_quat_i)
 
         self.last_rel_pos[:] = self.rel_pos[:]
         self.rel_pos = self.commands - self.base_pos
-
-        # 计算距离 (Local Only)
+        
         self.min_obstacle_dist = self._get_min_obstacle_distance()
         self.min_drone_dist = self._get_min_drone_distance()
 
-        # ==================== 终止条件 ====================
-        crash_any = torch.zeros((self.num_envs,), device=gs.device, dtype=torch.bool)
-        
-        # 机间碰撞检测 (适配新形状 (B, N))
+        # 5. 终止条件
+        phys_crash_any = torch.zeros((self.num_physical_envs,), device=gs.device, dtype=torch.bool)
         drone_collision_per_drone = self.min_drone_dist < self.env_cfg.get("drone_collision_distance", 0.3)
-        drone_collision_any = drone_collision_per_drone.any(dim=1)
+        phys_collision_any = drone_collision_per_drone.any(dim=1)
         
         for i in range(self.num_drones):
             drone_crash = (
                 (torch.abs(self.base_euler[:, i, 1]) > self.env_cfg["termination_if_pitch_greater_than"])
                 | (torch.abs(self.base_euler[:, i, 0]) > self.env_cfg["termination_if_roll_greater_than"])
                 | (self.base_pos[:, i, 2] < self.env_cfg["termination_if_close_to_ground"])
-                | (self.min_obstacle_dist[:, i] < self.obstacle_collision_distance) # 注意：如果是感知盲区，dist=100，这里不会触发crash
+                | (self.min_obstacle_dist[:, i] < self.obstacle_collision_distance)
             )
-            crash_any = crash_any | drone_crash
-            
+            phys_crash_any = phys_crash_any | drone_crash
             drone_success = torch.norm(self.rel_pos[:, i, :], dim=1) < self.env_cfg["at_target_threshold"]
             self.drone_ever_reached_target[:, i] = self.drone_ever_reached_target[:, i] | drone_success
 
-        crash_any = crash_any | drone_collision_any
-
-        success_all = torch.all(self.drone_ever_reached_target, dim=1)
-        self.crash_condition = crash_any
-        self.success_condition = success_all
-        time_out = self.episode_length_buf >= self.max_episode_length
-        self.reset_buf = crash_any | success_all | time_out
-
-        self.reset_idx(self.reset_buf.nonzero(as_tuple=False).reshape((-1,)))
-
-        # ==================== 计算奖励 ====================
+        phys_crash_any = phys_crash_any | phys_collision_any
+        phys_success_all = torch.all(self.drone_ever_reached_target, dim=1)
+        
+        self.phys_crash_cond = phys_crash_any
+        self.phys_success_cond = phys_success_all
+        
+        # 6. 计算奖励
         self.rew_buf[:] = 0.0
+        
+        # 先计算所有个体的原始奖励
+        raw_rewards = torch.zeros((self.num_physical_envs, self.num_drones), device=gs.device)
+        
         for name, reward_func in self.reward_functions.items():
             rew = reward_func() * self.reward_scales[name]
-            self.rew_buf += rew
+            # rew is (N*D,), reshape to (N, D)
+            rew_shaped = rew.view(self.num_physical_envs, self.num_drones)
+            raw_rewards += rew_shaped
             self.episode_sums[name] += rew
 
-        # ==================== 构建观测 (Local + 4D Flag + Top-2) ====================
+        # Team Reward Mixing
+        if self.team_spirit > 0:
+            team_mean_reward = raw_rewards.mean(dim=1, keepdim=True) # (N, 1)
+            final_rewards = (1.0 - self.team_spirit) * raw_rewards + self.team_spirit * team_mean_reward
+            self.rew_buf = final_rewards.flatten()
+        else:
+            self.rew_buf = raw_rewards.flatten()
+
+        # 7. 处理 Reset
+        phys_time_out = self.episode_length_buf.view(self.num_physical_envs, self.num_drones)[:, 0] >= self.max_episode_length
+        phys_reset = phys_crash_any | phys_success_all | phys_time_out
+        
+        self.reset_buf = phys_reset.repeat_interleave(self.num_drones)
+        env_ids_to_reset = self.reset_buf.nonzero(as_tuple=False).reshape((-1,))
+        if len(env_ids_to_reset) > 0:
+            self.reset_idx(env_ids_to_reset)
+
+        # 8. 计算观测
+        self._compute_observations()
+        
+        self.extras["privileged_obs"] = self.privileged_obs_buf
+        self.extras["time_outs"] = phys_time_out 
+
+        return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
+
+    def _compute_observations(self):
+        """
+        [修正]
+        1. Actor Obs: 移除 Relative Velocity，只保留 Relative Position + Mask (4维)
+        2. Critic Obs: 严格的 Global State (固定顺序拼接)
+        """
         obs_list = []
         has_obstacles = self.obstacle_pos_tensor.shape[0] > 0
-        sensing_radius = self.env_cfg.get("sensing_radius", 3.0)
+        sensing_radius = self.sensing_radius
         
+        # === 1. 构建每个 Agent 的 Local Observation ===
         for i in range(self.num_drones):
-            # 1. 基础观测 (17维)
+            # 基础信息 (17 dims: 3 rel_pos + 4 quat + 3 lin_vel + 3 ang_vel + 4 action)
             base_obs = torch.cat([
                 torch.clip(self.rel_pos[:, i, :] * self.obs_scales["rel_pos"], -1, 1),
                 self.base_quat[:, i, :],
                 torch.clip(self.base_lin_vel[:, i, :] * self.obs_scales["lin_vel"], -1, 1),
                 torch.clip(self.base_ang_vel[:, i, :] * self.obs_scales["ang_vel"], -1, 1),
-                self.last_actions[:, i*4:(i+1)*4],
+                self.last_actions_phys[:, i, :],
             ], dim=-1)
             
-            # 2. 队友感知 (4维: [x, y, z, mask])
-            other_drones_rel_pos = []
+            # 队友感知 (仅位置 + Mask)
+            other_drones_obs = []
             for j in range(self.num_drones):
                 if i != j:
+                    # 相对位置
                     rel_vec = self.base_pos[:, j, :] - self.base_pos[:, i, :]
                     dist = torch.norm(rel_vec, dim=1, keepdim=True)
-                    
-                    # 4维感知 Mask
                     mask = (dist < sensing_radius).float()
-                    
                     scaled_rel = torch.clip(rel_vec * self.obs_scales["rel_pos"], -1, 1)
-                    masked_rel = scaled_rel * mask
                     
-                    # [x, y, z, mask]
-                    obs_with_flag = torch.cat([masked_rel, mask], dim=-1)
-                    other_drones_rel_pos.append(obs_with_flag)
+                    masked_rel_pos = scaled_rel * mask
+                    
+                    # (3 pos + 1 mask) = 4 dims
+                    obs_with_flag = torch.cat([masked_rel_pos, mask], dim=-1)
+                    other_drones_obs.append(obs_with_flag)
             
-            # 3. 障碍物感知 (3维 + Top-2)
-            # 默认填充值 1.0 (表示"安全/边界外")
-            nearest_obs_vecs = torch.ones((self.num_envs, self.num_nearest_obstacles * 3), device=gs.device)
-            
+            # 障碍物感知 (Top-K)
+            nearest_obs_vecs = torch.ones((self.num_physical_envs, self.num_nearest_obstacles * 3), device=gs.device) * 2.0
             if has_obstacles:
                 curr_drone_pos = self.base_pos[:, i, :]
-                
-                # 计算水平距离
-                obs_pos_expanded = self.obstacle_pos_tensor.unsqueeze(0).expand(self.num_envs, -1, -1).clone()
+                obs_pos_expanded = self.obstacle_pos_tensor.unsqueeze(0).expand(self.num_physical_envs, -1, -1).clone()
                 obs_pos_expanded[:, :, 2] = curr_drone_pos[:, 2].unsqueeze(1) 
                 vecs = obs_pos_expanded - curr_drone_pos.unsqueeze(1) 
                 dists = torch.norm(vecs, dim=-1) 
                 
-                # 局部感知筛选
                 out_of_range_mask = dists > sensing_radius
                 dists_masked = dists.clone()
                 dists_masked[out_of_range_mask] = float('inf')
                 
-                # Top-K
                 k = min(self.num_nearest_obstacles, self.obstacle_pos_tensor.shape[0])
                 sorted_dists, indices = torch.topk(dists_masked, k, dim=1, largest=False)
-                
-                # 提取向量
                 indices_expanded = indices.unsqueeze(-1).expand(-1, -1, 3)
                 topk_vecs = torch.gather(vecs, 1, indices_expanded)
-                topk_vecs = topk_vecs * self.obs_scales["obstacle"]
-                topk_vecs = torch.clip(topk_vecs, -1, 1)
+                topk_vecs = torch.clip(topk_vecs * self.obs_scales["obstacle"], -1, 1)
                 
-                # Mask有效性
                 valid_mask = (sorted_dists < sensing_radius).unsqueeze(-1).float()
-                
-                # 融合
-                final_vecs = topk_vecs * valid_mask + 1.0 * (1.0 - valid_mask)
-                flat_obs = final_vecs.reshape(self.num_envs, -1)
-                
+                final_vecs = topk_vecs * valid_mask + 2.0 * (1.0 - valid_mask)
+                flat_obs = final_vecs.reshape(self.num_physical_envs, -1)
                 if k < self.num_nearest_obstacles:
                     nearest_obs_vecs[:, :k*3] = flat_obs
                 else:
                     nearest_obs_vecs = flat_obs
 
             # 拼接
-            drone_obs = torch.cat([base_obs] + other_drones_rel_pos + [nearest_obs_vecs], dim=-1)
+            drone_obs = torch.cat([base_obs] + other_drones_obs + [nearest_obs_vecs], dim=-1)
             obs_list.append(drone_obs)
         
-        self.obs_buf = torch.cat(obs_list, dim=-1)
-        self.last_actions[:] = self.actions[:]
-        self.extras["observations"]["critic"] = self.obs_buf
-
-        return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
+        # obs_list shape: [Num_Drones, Num_Physical_Envs, Obs_Dim]
+        stacked_local_obs = torch.stack(obs_list, dim=0) 
+        permuted_local_obs = stacked_local_obs.permute(1, 0, 2) # (N, D, Dim)
+        self.obs_buf = permuted_local_obs.reshape(self.num_envs, self.num_obs)
+        
+        # === 2. 构建 Critic 的 Global Observation (严格固定顺序) ===
+        global_state = stacked_local_obs.permute(1, 0, 2).reshape(self.num_physical_envs, -1)
+        global_state_expanded = global_state.unsqueeze(1).expand(-1, self.num_drones, -1)
+        self.privileged_obs_buf = global_state_expanded.reshape(self.num_envs, self.num_privileged_obs)
 
     def _get_min_obstacle_distance(self):
-        min_dist = torch.ones((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float) * 100.0
-        
-        if len(self.obstacles) == 0:
-            return min_dist
-            
+        min_dist = torch.ones((self.num_physical_envs, self.num_drones), device=gs.device, dtype=gs.tc_float) * 100.0
+        if len(self.obstacles) == 0: return min_dist
         radius = self.sensing_radius
-        
         for i in range(self.num_drones):
             drone_pos_xy = self.base_pos[:, i, :2]
-            
             for obs in self.obstacles:
                 obs_pos_xy = obs["pos"][:2].unsqueeze(0)
-                
                 dist_center = torch.norm(drone_pos_xy - obs_pos_xy, dim=1)
                 dist_surface = dist_center - obs["radius"]
-              
                 is_visible = dist_surface < radius
                 dist_filtered = torch.where(is_visible, dist_surface, torch.tensor(100.0, device=gs.device))
-                
                 min_dist[:, i] = torch.minimum(min_dist[:, i], dist_filtered)
-                
         return min_dist
 
     def _get_min_drone_distance(self):
-        min_dist = torch.ones((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float) * 100.0
+        min_dist = torch.ones((self.num_physical_envs, self.num_drones), device=gs.device, dtype=gs.tc_float) * 100.0
         radius = self.sensing_radius
-
         for i in range(self.num_drones):
             for j in range(self.num_drones):
-                if i == j:
-                    continue
-                
+                if i == j: continue
                 dist_3d = torch.norm(self.base_pos[:, i, :] - self.base_pos[:, j, :], dim=1)
-                
                 is_visible = dist_3d < radius
                 dist_filtered = torch.where(is_visible, dist_3d, torch.tensor(100.0, device=gs.device))
-                
                 min_dist[:, i] = torch.minimum(min_dist[:, i], dist_filtered)
-                
         return min_dist
 
     def get_observations(self):
-        self.extras["observations"]["critic"] = self.obs_buf
         return self.obs_buf, self.extras
 
     def get_privileged_observations(self):
-        return None
+        return self.privileged_obs_buf
 
-    def reset_idx(self, envs_idx):
-        if len(envs_idx) == 0:
-            return
+    def reset_idx(self, env_ids):
+        if len(env_ids) == 0: return
+        phys_env_ids = torch.unique(torch.div(env_ids, self.num_drones, rounding_mode='floor'))
+        if len(phys_env_ids) == 0: return
 
         for i, drone in enumerate(self.drones):
             init_pos = torch.tensor(self.drone_init_positions[i], device=gs.device)
-            self.base_pos[envs_idx, i, :] = init_pos
-            self.last_base_pos[envs_idx, i, :] = init_pos
-            self.base_quat[envs_idx, i, :] = self.base_init_quat
+            self.base_pos[phys_env_ids, i, :] = init_pos
+            self.last_base_pos[phys_env_ids, i, :] = init_pos
+            self.base_quat[phys_env_ids, i, :] = self.base_init_quat
             
-            drone.set_pos(self.base_pos[envs_idx, i, :], zero_velocity=True, envs_idx=envs_idx)
-            drone.set_quat(self.base_quat[envs_idx, i, :], zero_velocity=True, envs_idx=envs_idx)
-            drone.zero_all_dofs_velocity(envs_idx)
+            drone.set_pos(self.base_pos[phys_env_ids, i, :], zero_velocity=True, envs_idx=phys_env_ids)
+            drone.set_quat(self.base_quat[phys_env_ids, i, :], zero_velocity=True, envs_idx=phys_env_ids)
+            drone.zero_all_dofs_velocity(phys_env_ids)
 
-        self.base_lin_vel[envs_idx] = 0
-        self.base_ang_vel[envs_idx] = 0
-        self.last_actions[envs_idx] = 0.0
-        self.episode_length_buf[envs_idx] = 0
-        self.reset_buf[envs_idx] = True
-        self.drone_ever_reached_target[envs_idx] = False
+        self.base_lin_vel[phys_env_ids] = 0
+        self.base_ang_vel[phys_env_ids] = 0
+        self.last_actions_phys[phys_env_ids] = 0.0
+        self.prev_actions_phys[phys_env_ids] = 0.0
         
-        self.min_obstacle_dist[envs_idx] = 10.0
-        self.min_drone_dist[envs_idx] = 10.0
+        all_agent_indices = []
+        for p_id in phys_env_ids:
+            start = p_id * self.num_drones
+            for d in range(self.num_drones):
+                all_agent_indices.append(start + d)
+        all_agent_indices = torch.tensor(all_agent_indices, device=gs.device)
+
+        self.episode_length_buf[all_agent_indices] = 0
+        self.reset_buf[all_agent_indices] = True
+        self.drone_ever_reached_target[phys_env_ids] = False
+        self.min_obstacle_dist[phys_env_ids] = 10.0
+        self.min_drone_dist[phys_env_ids] = 10.0
 
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
             self.extras["episode"]["rew_" + key] = (
-                torch.mean(self.episode_sums[key][envs_idx]).item() / self.env_cfg["episode_length_s"]
+                torch.mean(self.episode_sums[key][all_agent_indices]).item() / self.env_cfg["episode_length_s"]
             )
-            self.episode_sums[key][envs_idx] = 0.0
+            self.episode_sums[key][all_agent_indices] = 0.0
 
-        self._resample_commands(envs_idx)
+        self._resample_commands(phys_env_ids)
+        self._compute_observations()
 
     def reset(self):
-        self.reset_buf[:] = True
         self.reset_idx(torch.arange(self.num_envs, device=gs.device))
-        return self.obs_buf, None
+        return self.obs_buf, self.privileged_obs_buf
 
     # ==================== 奖励函数 ====================
-    # 速度略快，降低引导；直线引导再增加；速度设置一下上限
     def _reward_target(self):
-        target_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
-        
-        for i in range(self.num_drones):
-            
-            #curr_dist_sq = torch.sum(torch.square(self.rel_pos[:, i, :]), dim=1)
-            #last_dist_sq = torch.sum(torch.square(self.last_rel_pos[:, i, :]), dim=1)
-            curr_dist = torch.norm(self.rel_pos[:, i, :], dim=1)
-            last_dist = torch.norm(self.last_rel_pos[:, i, :], dim=1)
-            
-            dist_reduction = last_dist - curr_dist
-            target_rew += dist_reduction 
-        
-            #target_rew += torch.clamp(5 - curr_dist, min=0) * 0.05
-            
-            drone_at_target = curr_dist < self.env_cfg["at_target_threshold"]
-            target_rew[drone_at_target] += 5.0 
-            target_rew[self.success_condition] += 15.0 
-        
-        return target_rew / self.num_drones
+        curr_dist = torch.norm(self.rel_pos, dim=2)
+        last_dist = torch.norm(self.last_rel_pos, dim=2)
+        dist_reduction = last_dist - curr_dist
+        rew = dist_reduction
+        drone_at_target = curr_dist < self.env_cfg["at_target_threshold"]
+        rew[drone_at_target] += 5.0
+        success_expanded = self.phys_success_cond.unsqueeze(1).expand(-1, self.num_drones)
+        rew[success_expanded] += 15.0
+        return rew.flatten()
 
     def _reward_smooth(self):
-        return torch.sum(torch.square(self.actions - self.last_actions), dim=1)
+        diff = self.last_actions_phys - self.prev_actions_phys
+        smooth_penalty = torch.sum(torch.square(diff), dim=2)
+        return -smooth_penalty.flatten()
 
     def _reward_yaw(self):
-        yaw = self.base_euler[:, :, 2]  # (num_envs, num_drones)
-        yaw = torch.where(yaw > 180, yaw - 360, yaw) / 180 * 3.14159  # use rad for yaw_reward
+        yaw = self.base_euler[:, :, 2]
+        yaw = torch.where(yaw > 180, yaw - 360, yaw) / 180 * 3.14159
         yaw_rew = torch.exp(self.reward_cfg["yaw_lambda"] * torch.abs(yaw))
-        return torch.mean(yaw_rew, dim=1)  # 对所有无人机求平均，返回 (num_envs,)
+        return yaw_rew.flatten()
 
     def _reward_angular(self):
-        angular_rew = torch.norm(self.base_ang_vel / 3.14159, dim=2)  # (num_envs, num_drones)
-        return torch.mean(angular_rew, dim=1)  # 对所有无人机求平均，返回 (num_envs,)
+        angular_rew = torch.norm(self.base_ang_vel / 3.14159, dim=2)
+        return angular_rew.flatten()
 
     def _reward_crash(self):
-        crash_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
-        crash_rew[self.crash_condition] = 1.0
-        return crash_rew
+        crash_expanded = self.phys_crash_cond.unsqueeze(1).expand(-1, self.num_drones)
+        return crash_expanded.float().flatten()
 
     def _reward_obstacle(self):
-        obstacle_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
-        if len(self.obstacles) == 0:
-            return obstacle_rew
-
-        for i in range(self.num_drones):
-            d = self.min_obstacle_dist[:, i]
+        obstacle_rew = torch.zeros((self.num_physical_envs, self.num_drones), device=gs.device)
+        if len(self.obstacles) > 0:
+            d = self.min_obstacle_dist
             safe_dist = self.obstacle_safe_distance
             mask = d < safe_dist
-            if mask.any():
-                obstacle_rew[mask] += (safe_dist - d[mask]) / safe_dist
-
-        return obstacle_rew / self.num_drones
+            obstacle_rew[mask] = (safe_dist - d[mask]) / safe_dist
+        return obstacle_rew.flatten()
 
     def _reward_separation(self):
-        sep_rew_per_drone = torch.zeros((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float)
+        sep_rew = torch.zeros((self.num_physical_envs, self.num_drones), device=gs.device)
         danger_dist = self.drone_safe_distance
-        
-        close_mask = self.min_drone_dist < danger_dist
-        if close_mask.any():
-            # 计算归一化惩罚 (0.0 ~ 1.0)
-            sep_rew_per_drone[close_mask] = (danger_dist - self.min_drone_dist[close_mask]) / danger_dist
-        
-        return torch.mean(sep_rew_per_drone, dim=1)
+        mask = self.min_drone_dist < danger_dist
+        sep_rew[mask] = (danger_dist - self.min_drone_dist[mask]) / danger_dist
+        return sep_rew.flatten()
 
     def _reward_alive(self):
-        alive_rew = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_float)
-        alive_rew[self.crash_condition] = 0.0
-        return alive_rew
+        alive_rew = torch.ones((self.num_physical_envs, self.num_drones), device=gs.device)
+        crash_expanded = self.phys_crash_cond.unsqueeze(1).expand(-1, self.num_drones)
+        alive_rew[crash_expanded] = 0.0
+        return alive_rew.flatten()
 
     def _reward_progress(self):
-        """
-        Alignment Reward
-        计算“当前速度方向”与“目标方向”的余弦相似度。
-        范围：[-1.0, 1.0]
-        """
-        alignment_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
-
-        for i in range(self.num_drones):
-            # self.rel_pos 已经是 (Goal - Pos)
-            target_vec = self.rel_pos[:, i, :] 
-            # 归一化 (添加极小值防止除以0)
-            target_dir = target_vec / (torch.norm(target_vec, dim=1, keepdim=True) + 1e-6)
-
-            vel_vec = self.base_lin_vel[:, i, :]
-            speed = torch.norm(vel_vec, dim=1, keepdim=True)
-            # 归一化
-            vel_dir = vel_vec / (speed + 1e-6)
-            dot_prod = torch.sum(target_dir * vel_dir, dim=1)
-            
-            # 如果速度非常小(接近悬停)，方向可能是噪声，可以将奖励置为0
-            mask_static = speed.squeeze(-1) < 0.05
-            dot_prod[mask_static] = 0.0
-
-            alignment_rew += dot_prod
-
-        return alignment_rew / self.num_drones
+        target_vec = self.rel_pos
+        target_dir = target_vec / (torch.norm(target_vec, dim=2, keepdim=True) + 1e-6)
+        vel_vec = self.base_lin_vel
+        speed = torch.norm(vel_vec, dim=2, keepdim=True)
+        vel_dir = vel_vec / (speed + 1e-6)
+        dot_prod = torch.sum(target_dir * vel_dir, dim=2)
+        mask_static = speed.squeeze(-1) < 0.05
+        dot_prod[mask_static] = 0.0
+        return dot_prod.flatten()

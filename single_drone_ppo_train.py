@@ -66,7 +66,7 @@ def get_train_cfg(exp_name, max_iterations):
     return train_cfg_dict
 
 def generate_circular_obstacles(max_radius=2.5, obstacle_radius=0.12, spacing=0.9):
-    """生成障碍物阵列"""
+    """生成圆形障碍物阵列（原始训练配置）"""
     obstacles = []
     start_radius = 0.8 
     current_radius = start_radius
@@ -81,16 +81,103 @@ def generate_circular_obstacles(max_radius=2.5, obstacle_radius=0.12, spacing=0.
         current_radius += spacing * 0.9 
     return obstacles
 
-def get_cfgs():
+def generate_grid_obstacles(arena_radius=3.5, obstacle_radius=0.1, grid_spacing=0.8, center_gap=1.0):
+    """生成网格布局障碍物（用于泛化性验证）"""
+    obstacles = []
+    # 计算网格范围
+    grid_range = arena_radius - center_gap
+    num_cells = int(grid_range / grid_spacing)
+    
+    # 生成网格点
+    for i in range(-num_cells, num_cells + 1):
+        for j in range(-num_cells, num_cells + 1):
+            x = i * grid_spacing
+            y = j * grid_spacing
+            
+            # 跳过中心区域（给无人机起飞空间）
+            dist_from_center = math.sqrt(x*x + y*y)
+            if dist_from_center < center_gap:
+                continue
+            
+            # 确保在arena范围内
+            if dist_from_center <= arena_radius:
+                obstacles.append([x, y, 1.0])
+    
+    return obstacles
+
+def generate_random_obstacles(arena_radius=3.5, obstacle_radius=0.1, num_obstacles=30, center_gap=1.0, seed=None):
+    """生成随机分布障碍物（用于泛化性验证）"""
+    import random
+    if seed is not None:
+        random.seed(seed)
+    
+    obstacles = []
+    attempts = 0
+    max_attempts = num_obstacles * 10
+    
+    while len(obstacles) < num_obstacles and attempts < max_attempts:
+        attempts += 1
+        # 在圆形区域内随机采样
+        r = math.sqrt(random.random()) * arena_radius
+        theta = random.random() * 2 * math.pi
+        x = r * math.cos(theta)
+        y = r * math.sin(theta)
+        
+        # 跳过中心区域
+        if math.sqrt(x*x + y*y) < center_gap-0.8:
+            continue
+        
+        # 检查是否与现有障碍物太近（确保障碍物中心距离大于0.6m）
+        too_close = False
+        min_spacing = 0.6  # 障碍物中心之间的最小距离（边缘到边缘约0.4m）
+        for obs in obstacles:
+            dist = math.sqrt((x - obs[0])**2 + (y - obs[1])**2)
+            if dist < min_spacing:
+                too_close = True
+                break
+        
+        if not too_close:
+            obstacles.append([x, y, 1.0])
+    
+    return obstacles
+
+def get_cfgs(obstacle_type="circular"):
+    """
+    获取环境配置
+    Args:
+        obstacle_type: 障碍物类型
+            - "circular": 圆形阵列（原始训练配置）
+            - "grid": 网格布局（泛化性验证）
+            - "random": 随机分布（泛化性验证）
+    """
     num_drones = 1
     
-    # === 修改 1: 扩大障碍物范围，增加两圈左右 (2.8 -> 4.5) ===
     arena_radius = 3.5
-    obstacle_pos_list = generate_circular_obstacles(
-        max_radius=arena_radius, 
-        obstacle_radius=0.1, 
-        spacing=0.8
-    )
+    
+    # 根据类型生成不同的障碍物配置
+    if obstacle_type == "circular":
+        obstacle_pos_list = generate_circular_obstacles(
+            max_radius=arena_radius, 
+            obstacle_radius=0.1, 
+            spacing=0.8
+        )
+    elif obstacle_type == "grid":
+        obstacle_pos_list = generate_grid_obstacles(
+            arena_radius=arena_radius,
+            obstacle_radius=0.1,
+            grid_spacing=0.8,
+            center_gap=1.0
+        )
+    elif obstacle_type == "random":
+        obstacle_pos_list = generate_random_obstacles(
+            arena_radius=arena_radius,
+            obstacle_radius=0.1,
+            num_obstacles=30,
+            center_gap=1.0,
+            seed=42  # 固定种子以确保可重复性
+        )
+    else:
+        raise ValueError(f"Unknown obstacle_type: {obstacle_type}. Choose from 'circular', 'grid', 'random'")
 
     env_cfg = {
         "num_drones": num_drones,
@@ -109,7 +196,7 @@ def get_cfgs():
         # 悬停参数
         "hover_duration_s": 0.5, # 悬停时间
 
-        "episode_length_s": 40.0, # 增加一点时间，因为要悬停
+        "episode_length_s": 45.0, # 增加一点时间，因为要悬停
         "at_target_threshold": 0.4,
         "simulate_action_latency": True,
         "clip_actions": 1.0,
@@ -168,6 +255,9 @@ def main():
     parser.add_argument("--resume", action="store_true", default=False)
     parser.add_argument("--ckpt", type=int, default=-1)
     parser.add_argument("--update_config", action="store_true", default=False)
+    parser.add_argument("--obstacle_type", type=str, default="circular", 
+                       choices=["circular", "grid", "random"],
+                       help="障碍物类型: circular(圆形阵列), grid(网格布局), random(随机分布)")
     args = parser.parse_args()
 
     gs.init(backend=gs.gpu, precision="32", logging_level="warning", performance_mode=True)
@@ -182,8 +272,8 @@ def main():
         cfg_path = f"{log_dir}/cfgs.pkl"
         
         if args.update_config:
-            print("[更新配置] 使用新的配置参数")
-            env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs()
+            print(f"[更新配置] 使用新的配置参数，障碍物类型: {args.obstacle_type}")
+            env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs(obstacle_type=args.obstacle_type)
             train_cfg = get_train_cfg(args.exp_name, args.max_iterations)
             pickle.dump(
                 [env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg],
@@ -210,7 +300,8 @@ def main():
         train_cfg["runner"]["resume"] = True
         train_cfg["runner"]["resume_path"] = resume_path
     else:
-        env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs()
+        print(f"[新训练] 障碍物类型: {args.obstacle_type}")
+        env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs(obstacle_type=args.obstacle_type)
         train_cfg = get_train_cfg(args.exp_name, args.max_iterations)
         
         if os.path.exists(log_dir):
@@ -248,21 +339,27 @@ if __name__ == "__main__":
 """
 # PPO单无人机训练命令
 
-# 1. 新训练（无可视化，快速训练）
+# 1. 新训练（无可视化，快速训练）- 使用圆形障碍物（默认）
 python single_drone_ppo_train.py -e single-drone-ppo-v2 -B 4096 --max_iterations 800
 
-# 2. 新训练（带可视化）
+# 2. 新训练（使用网格布局障碍物）
+python single_drone_ppo_train.py -e single-drone-ppo-grid -B 4096 --max_iterations 800 --obstacle_type grid
+
+# 3. 新训练（使用随机分布障碍物）
+python single_drone_ppo_train.py -e single-drone-ppo-random -B 4096 --max_iterations 800 --obstacle_type random
+
+# 4. 新训练（带可视化）
 python single_drone_ppo_train.py -e single-drone-ppo -B 64 --max_iterations 800 -v
 
-# 3. 从最新检查点恢复训练（微调）
+# 5. 从最新检查点恢复训练（微调）
 python single_drone_ppo_train.py -e single-drone-ppo -B 4096 --max_iterations 1000 --resume
 
-# 4. 从指定检查点恢复训练（微调）
+# 6. 从指定检查点恢复训练（微调）
 python single_drone_ppo_train.py -e single-drone-ppo -B 8192 --max_iterations 1000 --resume --ckpt 400
 
-# 5. 微调训练（带可视化）
+# 7. 微调训练（带可视化）
 python single_drone_ppo_train.py -e single-drone-ppo -B 64 --max_iterations 1000 --resume -v
 
-# 6. 微调（加载新配置）
-python single_drone_ppo_train.py -e single-drone-ppo -B 8192 --max_iterations 1000 --resume --ckpt 400 --update_config
+# 8. 微调（加载新障碍物配置）
+python single_drone_ppo_train.py -e single-drone-ppo -B 8192 --max_iterations 1000 --resume --ckpt 400 --update_config --obstacle_type grid
 """

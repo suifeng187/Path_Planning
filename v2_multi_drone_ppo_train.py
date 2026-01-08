@@ -144,7 +144,7 @@ def get_cfgs():
     reward_cfg = {
         "yaw_lambda": -10.0,
         "reward_scales": {
-            "target": 20.0,      
+            "target": 30.0,      
             "progress": 1,     
             "alive": 0.01,
             "smooth": -1e-3,
