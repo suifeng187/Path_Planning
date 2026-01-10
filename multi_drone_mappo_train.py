@@ -1,10 +1,12 @@
 """
-多无人机避障路径规划训练脚本 - MAPPO版本 (配置更新)
+多无人机避障路径规划训练脚本 - MAPPO版本 (配置更新 - 圆形障碍物与多轮任务)
 """
 import argparse
 import os
 import pickle
 import shutil
+import math
+import random
 import genesis as gs
 from multi_drone_mappo_env import MultiDroneMAPPOEnv
 from rsl_rl.runners import OnPolicyRunner
@@ -15,6 +17,22 @@ except ImportError:
     print("Error: Could not import 'mappo_algorithm.py'.")
     exit()
 
+def generate_circular_obstacles(max_radius=3, obstacle_radius=0.12, spacing=1):
+    """生成圆形障碍物阵列"""
+    obstacles = []
+    start_radius = 0.8 
+    current_radius = start_radius
+    while current_radius <= max_radius:
+        circumference = 2 * math.pi * current_radius
+        num_obs_in_ring = int(circumference / spacing)
+        for i in range(num_obs_in_ring):
+            angle = 2 * math.pi * i / num_obs_in_ring
+            x = current_radius * math.cos(angle)
+            y = current_radius * math.sin(angle)
+            obstacles.append([x, y, 1.0])
+        current_radius += spacing * 0.9 
+    return obstacles
+
 def get_train_cfg(exp_name, max_iterations):
     train_cfg_dict = {
         "algorithm": {
@@ -24,7 +42,7 @@ def get_train_cfg(exp_name, max_iterations):
             "entropy_coef": 0.01,
             "gamma": 0.99,
             "lam": 0.95,
-            "learning_rate": 0.0003,
+            "learning_rate": 0.001,
             "max_grad_norm": 0.5,
             "num_learning_epochs": 5,
             "num_mini_batches": 4,
@@ -54,21 +72,26 @@ def get_train_cfg(exp_name, max_iterations):
 def get_cfgs():
     num_drones = 3
     
+    # [NEW] 生成圆形障碍物分布
+    obstacles = generate_circular_obstacles(max_radius=3, obstacle_radius=0.1, spacing=1.0)
+    
     env_cfg = {
         "num_drones": num_drones,
         "num_actions": 4,
-        "team_spirit": 0.3, # 团队合作系数
+        "team_spirit": 0.2, # 团队合作系数
         "termination_if_roll_greater_than": 60,
         "termination_if_pitch_greater_than": 60,
         "termination_if_close_to_ground": 0.02,
+        # [NEW] 初始位置：距离圆形区域(R=3.5) 1米，即 x = -4.5 附近
         "drone_init_positions": [
-            [-1.0, -2.5, 0.8], [0.0, -2.5, 0.8], [1.0, -2.5, 0.8],
+            [-4, -1.5, 1.0], [-4, 0.0, 1.0], [-4, 1.5, 1.0],
         ],
-        "drone_goal_positions": [
-            [-1.0, 2.5, 0.8], [0.0, 2.5, 0.8], [1.0, 2.5, 0.8],
-        ],
-        "episode_length_s": 35.0,
-        "at_target_threshold": 0.4,
+        # [NEW] 目标位置不再固定，将在 Env 中随机生成，此处留空或作为占位
+        "drone_goal_positions": [], 
+        "episode_length_s": 50.0, # [NEW] 增加时间以适应 5 轮任务
+        "rounds_per_episode": 5,   # [NEW] 每轮 Episode 需要完成 5 次目标
+        "obstacle_area_radius": 3.51, # [NEW] 障碍物区域半径
+        "at_target_threshold": 0.3,
         "simulate_action_latency": True,
         "clip_actions": 1.0,
         "visualize_target": False,
@@ -76,17 +99,12 @@ def get_cfgs():
         "max_visualize_FPS": 60,
         "sensing_radius": 3.0,
         "num_nearest_obstacles": 2,
-        "obstacle_positions": [
-            [-2.25, -1.5, 1.0], [-1.35, -1.5, 1.0], [-0.45, -1.5, 1.0], [0.45, -1.5, 1.0], [1.35, -1.5, 1.0], [2.25, -1.5, 1.0],
-            [-1.8, -0.5, 1.0], [-0.9, -0.5, 1.0], [0.0, -0.5, 1.0], [0.9, -0.5, 1.0], [1.8, -0.5, 1.0],
-            [-2.25,  0.5, 1.0], [-1.35,  0.5, 1.0], [-0.45, 0.5, 1.0], [0.45, 0.5, 1.0], [1.35, 0.5, 1.0], [2.25, 0.5, 1.0],
-            [-1.8,  1.5, 1.0], [-0.9, 1.5, 1.0], [0.0, 1.5, 1.0], [0.9, 1.5, 1.0], [1.8, 1.5, 1.0],
-        ],
+        "obstacle_positions": obstacles,
         "obstacle_radius": 0.1,
         "obstacle_height": 2.5,
         "obstacle_safe_distance": 0.3,
         "obstacle_collision_distance": 0.1,
-        "drone_safe_distance": 0.2,
+        "drone_safe_distance": 0.4,
         "drone_collision_distance": 0.1,
     }
     
@@ -104,7 +122,7 @@ def get_cfgs():
         "num_privileged_obs": global_obs_dim,
         "num_obs_per_drone": local_obs_dim,
         "obs_scales": {
-            "rel_pos": 1 / 6.0,  # 缩放系数需要大于等于无人机到达目标点的距离
+            "rel_pos": 1 / 8.0, 
             "lin_vel": 1 / 3.0,
             "ang_vel": 1 / 3.14159,
             "obstacle": 1 / 3.0, 
@@ -115,14 +133,15 @@ def get_cfgs():
         "yaw_lambda": -10.0,
         "reward_scales": {
             "target": 30.0,      
-            "progress": 0.4,     
-            "alive": 0.0001,
+            "progress": 1,     
+            "alive": 0,
             "smooth": -0.01,
             "yaw": 0.2,
             "angular": -0.05,
-            "crash": -15.0,
-            "obstacle": -4.0,
-            "separation": -2.0,
+            "crash": -30.0,
+            "obstacle": -6.0,
+            "separation": -5.0,
+            "team_coordination": 0.2,
         },
     }
     
@@ -211,7 +230,7 @@ if __name__ == "__main__":
 # MAPPO多无人机训练命令
 
 # 1. 新训练（无可视化，快速训练）
-python multi_drone_mappo_train.py -e multi-drone-mappo -B 4096 --max_iterations 800
+python multi_drone_mappo_train.py -e multi-drone-mappo-v2 -B 4096 --max_iterations 800
 
 # 2. 新训练（带可视化）
 python multi_drone_mappo_train.py -e multi-drone-mappo -B 64 --max_iterations 800 -v

@@ -18,7 +18,7 @@ class ActorCritic(nn.Module):
 
         act_func = nn.ELU() if activation.lower() == "elu" else nn.ReLU()
 
-        # Actor
+        # Actor 网络
         actor_layers = []
         prev_dim = num_actor_obs
         for dim in actor_hidden_dims:
@@ -28,13 +28,14 @@ class ActorCritic(nn.Module):
         actor_layers.append(nn.Linear(prev_dim, num_actions))
         self.actor = nn.Sequential(*actor_layers)
         
+        # 初始化 Actor 最后一层，使其输出接近 0
         last_layer = self.actor[-1]
         nn.init.orthogonal_(last_layer.weight, 0.01)
         nn.init.constant_(last_layer.bias, 0.0)
         
         self.log_std = nn.Parameter(np.log(init_noise_std) * torch.ones(num_actions))
 
-        # Critic
+        # Critic 网络
         critic_layers = []
         prev_dim = num_critic_obs
         for dim in critic_hidden_dims:
@@ -59,7 +60,7 @@ class ActorCritic(nn.Module):
 
     def get_actions_log_prob_entropy_value(self, actor_obs, critic_obs, action=None):
         mean = self.actor(actor_obs)
-        # [优化] Std Clamping
+        # Std Clamping: 防止方差过小导致数值不稳定
         std = self.log_std.exp().expand_as(mean)
         std = torch.clamp(std, min=0.05) 
         
@@ -78,13 +79,16 @@ class MAPPO:
     def __init__(self, actor_critic, cfg):
         self.ac = actor_critic
         self.cfg = cfg
-        self.optimizer = optim.Adam(self.ac.parameters(), lr=cfg["learning_rate"])
+        
+        self.learning_rate = cfg["learning_rate"]
+        self.optimizer = optim.Adam(self.ac.parameters(), lr=self.learning_rate)
         
     def update(self, storage):
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy_loss = 0
         
+        # 展平缓冲区数据
         b_obs = storage["obs"].reshape((-1, storage["obs"].shape[-1]))
         b_priv_obs = storage["priv_obs"].reshape((-1, storage["priv_obs"].shape[-1]))
         b_actions = storage["actions"].reshape((-1, storage["actions"].shape[-1]))
@@ -93,8 +97,14 @@ class MAPPO:
         b_returns = storage["returns"].reshape(-1)
         b_values = storage["values"].reshape(-1)
 
+        # Advantage Normalization (Batch Level)
+        b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+
         batch_size = b_obs.shape[0]
         minibatch_size = batch_size // self.cfg["num_mini_batches"]
+
+        accumulated_kl = 0.0
+        num_updates = 0
 
         for _ in range(self.cfg["num_learning_epochs"]):
             indices = torch.randperm(batch_size, device=b_obs.device)
@@ -108,8 +118,12 @@ class MAPPO:
                 
                 log_ratio = new_logprob - b_logprobs[mb_idx]
                 ratio = torch.exp(log_ratio)
+                
+                with torch.no_grad():
+                    approx_kl = ((log_ratio ** 2) * 0.5).mean()
+                    accumulated_kl += approx_kl.item()
+                
                 mb_advantages = b_advantages[mb_idx]
-                mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
                 surr1 = ratio * mb_advantages
                 surr2 = torch.clamp(ratio, 1.0 - self.cfg["clip_param"], 1.0 + self.cfg["clip_param"]) * mb_advantages
@@ -136,12 +150,26 @@ class MAPPO:
                 mean_value_loss += v_loss.item()
                 mean_surrogate_loss += policy_loss.item()
                 mean_entropy_loss += entropy.mean().item()
+                num_updates += 1
 
-        num_updates = self.cfg["num_learning_epochs"] * self.cfg["num_mini_batches"]
+        mean_kl = accumulated_kl / num_updates
+        
+        if self.cfg.get("schedule", "fixed") == "adaptive":
+            target_kl = self.cfg["desired_kl"]
+            if mean_kl > target_kl * 2.0:
+                self.learning_rate = max(1e-6, self.learning_rate / 1.5)
+            elif mean_kl < target_kl / 2.0 and mean_kl > 0.0:
+                self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.learning_rate
+
         return {
             "loss/value_function": mean_value_loss / num_updates,
             "loss/surrogate": mean_surrogate_loss / num_updates,
-            "loss/entropy": mean_entropy_loss / num_updates
+            "loss/entropy": mean_entropy_loss / num_updates,
+            "policy/mean_kl": mean_kl,
+            "policy/learning_rate": self.learning_rate
         }
 
 class MAPPORunner:
@@ -191,18 +219,23 @@ class MAPPORunner:
         }
         
         self.ep_infos = deque(maxlen=100)
+        
+        # [NEW] 记录当前开始的迭代次数，默认为 0
+        self.start_iteration = 0
 
     def learn(self, num_learning_iterations=None, init_at_random_ep_len=False):
+        # 如果未指定，默认训练到 max_iterations
         if num_learning_iterations is None:
             num_learning_iterations = self.max_iterations
 
         obs, extras = self.env.get_observations()
         priv_obs = self.env.get_privileged_observations()
         
-        print(f"Starting Training: {num_learning_iterations} iterations")
+        print(f"Starting Training: {num_learning_iterations} iterations (Start from {self.start_iteration})")
         start_time = time.time()
         
-        for it in range(num_learning_iterations):
+        # [NEW] 循环从 self.start_iteration 开始
+        for it in range(self.start_iteration, num_learning_iterations):
             with torch.inference_mode():
                 for step in range(self.num_steps_per_env):
                     self.storage["obs"][step] = obs
@@ -238,13 +271,13 @@ class MAPPORunner:
             self.compute_returns(last_val)
             stats = self.alg.update(self.storage)
             
-            # [优化] 显存清理
             if it > 0 and it % 100 == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
 
             self.log(it, stats, start_time)
             
+            # 使用 it+1 作为保存的文件名，确保连续性
             if (it + 1) % self.save_interval == 0:
                 self.save(it + 1)
 
@@ -256,7 +289,6 @@ class MAPPORunner:
             if step == self.num_steps_per_env - 1:
                 next_values = last_values
                 is_time_out = self.storage["time_outs"][step].float()
-                # 如果是 time_out，不截断 Value 传播
                 next_is_not_terminal = 1.0 - (self.storage["dones"][step].float() * (1.0 - is_time_out))
             else:
                 next_values = self.storage["values"][step + 1]
@@ -272,7 +304,8 @@ class MAPPORunner:
         mean_rew = self.storage["rewards"].sum() / self.num_envs
         fps = int(self.num_steps_per_env * self.num_envs / (time.time() - start_time + 1e-6))
         
-        log_string = f"Iter {it+1}/{self.max_iterations} | Rew: {mean_rew:.2f} | Loss: {stats['loss/surrogate']:.4f} | FPS: {fps}"
+        # 显示的 Log 是当前实际迭代次数
+        log_string = f"Iter {it+1}/{self.max_iterations} | Rew: {mean_rew:.2f} | Loss: {stats['loss/surrogate']:.4f} | KL: {stats['policy/mean_kl']:.4f} | LR: {stats['policy/learning_rate']:.6f} | FPS: {fps}"
         
         if len(self.ep_infos) > 0:
             keys = self.ep_infos[0].keys()
@@ -285,7 +318,7 @@ class MAPPORunner:
                         ep_stats[k] = mean_val
                         self.writer.add_scalar(f"Episode/{k}", mean_val, it)
             
-            core_keys = ["rew_target", "rew_progress", "rew_crash", "rew_obstacle"]
+            core_keys = ["rew_target", "rew_progress", "rew_crash", "rew_obstacle","rew_team_coordination"]
             for k in core_keys:
                 if k in ep_stats:
                     log_string += f" | {k[4:]}: {ep_stats[k]:.4f}"
@@ -301,7 +334,7 @@ class MAPPORunner:
         path = os.path.join(self.log_dir, f"model_{it}.pt")
         torch.save({
             'model_state_dict': self.alg.ac.state_dict(),
-            'iteration': it,
+            'iteration': it, # 保存当前迭代次数
             'config': {'num_actor_obs': self.num_actor_obs, 'num_critic_obs': self.num_critic_obs}
         }, path)
         print(f"Model saved: {path}")
@@ -309,4 +342,8 @@ class MAPPORunner:
     def load(self, path):
         checkpoint = torch.load(path, map_location=self.device)
         self.alg.ac.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Loaded model from {path}")
+        
+        # [NEW] 读取保存的迭代次数，以便从此处继续计数
+        self.start_iteration = checkpoint.get('iteration', 0)
+        
+        print(f"Loaded model from {path}, resuming from iter: {self.start_iteration}")
