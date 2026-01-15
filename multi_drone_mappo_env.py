@@ -1,10 +1,6 @@
 """
-多无人机避障路径规划环境 - MAPPO版本 (CTDE架构 - 修正版)
-修改记录：
-1. Critic观测：严格的 Global State (固定顺序 [Drone1, Drone2, ...])。
-2. Actor观测：移除相对速度，保留基础感知。
-3. Reward：引入 Team Reward 混合机制。
-4. [NEW] 引入多轮次目标刷新机制 (5 rounds per episode) 和随机目标生成。
+多无人机避障路径规划环境 - MAPPO版本 (CTDE架构)
+
 """
 import torch
 import math
@@ -45,13 +41,13 @@ class MultiDroneMAPPOEnv:
         self.obs_scales = obs_cfg["obs_scales"]
         self.reward_scales = copy.deepcopy(reward_cfg["reward_scales"])
         
-        # [NEW] 团队奖励系数 (0.0: 完全自私, 1.0: 完全平均)
+        # 团队奖励系数 (0.0: 完全自私, 1.0: 完全平均)
         self.team_spirit = env_cfg.get("team_spirit", 0.3) 
         
         self.sensing_radius = env_cfg.get("sensing_radius", 3.0)
         self.num_nearest_obstacles = env_cfg.get("num_nearest_obstacles", 2)
 
-        # [NEW] 轮次控制参数
+        # 轮次控制参数
         self.rounds_per_ep = env_cfg.get("rounds_per_episode", 5)
         self.obstacle_area_radius = env_cfg.get("obstacle_area_radius", 3.5)
         self.success_rounds = torch.zeros(self.num_physical_envs, device=self.device, dtype=torch.long)
@@ -212,7 +208,7 @@ class MultiDroneMAPPOEnv:
 
     def _resample_commands(self, physical_envs_idx):
         """
-        [NEW] 随机生成目标点，并确保目标点不在障碍物内部
+        随机生成目标点，并确保目标点不在障碍物内部
         """
         num_resample = len(physical_envs_idx)
         if num_resample == 0:
@@ -366,19 +362,14 @@ class MultiDroneMAPPOEnv:
         phys_crash_any = phys_crash_any | phys_collision_any
         phys_success_all = torch.all(self.drone_ever_reached_target, dim=1) # 这一帧是否所有无人机都到达过目标
         
-        # ================= [NEW] 处理多轮目标逻辑 =================
+        # ================= 处理多轮目标逻辑 =================
         # 找出本帧完成任务的环境
         env_ids_success = phys_success_all.nonzero(as_tuple=False).flatten()
         
         if len(env_ids_success) > 0:
             # 增加成功轮数
             self.success_rounds[env_ids_success] += 1
-            
-            # 判断哪些是真的完成了所有轮次 (>= 5)
-            # 注意：这里判断的是 >= rounds_per_ep。
-            # 如果刚刚达到5，说明这一个episode结束了，应该触发Reset。
-            # 如果 < 5，说明只是完成了一次子任务，应该刷新目标而不是Reset。
-            
+
             is_episode_done = self.success_rounds[env_ids_success] >= self.rounds_per_ep
             
             env_ids_next_round = env_ids_success[~is_episode_done]
@@ -390,8 +381,6 @@ class MultiDroneMAPPOEnv:
                 self.drone_ever_reached_target[env_ids_next_round] = False
                 # 3. 强制把 phys_success_all 置为 False，防止触发下面的 reset_idx
                 phys_success_all[env_ids_next_round] = False
-
-        # ========================================================
 
         self.phys_crash_cond = phys_crash_any
         self.phys_success_cond = phys_success_all
@@ -435,16 +424,11 @@ class MultiDroneMAPPOEnv:
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
 
     def _compute_observations(self):
-        """
-        [修正]
-        1. Actor Obs: 移除 Relative Velocity，只保留 Relative Position + Mask (4维)
-        2. Critic Obs: 严格的 Global State (固定顺序拼接)
-        """
         obs_list = []
         has_obstacles = self.obstacle_pos_tensor.shape[0] > 0
         sensing_radius = self.sensing_radius
         
-        # === 1. 构建每个 Agent 的 Local Observation ===
+        # === 构建每个 Agent 的 Local Observation ===
         for i in range(self.num_drones):
             # 基础信息 (17 dims: 3 rel_pos + 4 quat + 3 lin_vel + 3 ang_vel + 4 action)
             base_obs = torch.cat([
@@ -507,7 +491,7 @@ class MultiDroneMAPPOEnv:
         permuted_local_obs = stacked_local_obs.permute(1, 0, 2) # (N, D, Dim)
         self.obs_buf = permuted_local_obs.reshape(self.num_envs, self.num_obs)
         
-        # === 2. 构建 Critic 的 Global Observation (严格固定顺序) ===
+        # === 构建 Critic 的 Global Observation ===
         global_state = stacked_local_obs.permute(1, 0, 2).reshape(self.num_physical_envs, -1)
         global_state_expanded = global_state.unsqueeze(1).expand(-1, self.num_drones, -1)
         self.privileged_obs_buf = global_state_expanded.reshape(self.num_envs, self.num_privileged_obs)
@@ -669,24 +653,9 @@ class MultiDroneMAPPOEnv:
         return dot_prod.flatten()
 
     def _reward_team_coordination(self):
-        """
-        团队协同惩罚：基于距离目标最远的无人机 (Max Distance)
-        逻辑：Penalty = tanh(Max_Dist / Scale)
-        范围：[0, 1]
-        特性：距离小 -> 0, 距离大 -> 1.0
-        """
-        # 1. 计算每个无人机距离各自目标的距离
         dists = torch.norm(self.rel_pos, dim=2)
-        
-        # 2. 找出“短板”：距离最远的那架无人机
         max_dist, _ = torch.max(dists, dim=1)  # shape: (num_envs,)
-        
-        # 3. 归一化缩放
         scale_factor = 6.0
-        
-        # 使用 tanh 实现平滑的 [0, 1] 映射
         penalty = torch.tanh(max_dist / scale_factor)
-        
-        # 4. 转换为负奖励并扩展维度
         rew = -penalty
         return rew.unsqueeze(1).expand(-1, self.num_drones).flatten()

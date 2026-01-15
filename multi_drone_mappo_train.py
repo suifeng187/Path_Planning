@@ -1,5 +1,5 @@
 """
-多无人机避障路径规划训练脚本 - MAPPO版本 (配置更新 - 圆形障碍物与多轮任务)
+多无人机避障路径规划训练脚本 - MAPPO版本 (圆形障碍物与多轮任务)
 """
 import argparse
 import os
@@ -17,7 +17,7 @@ except ImportError:
     print("Error: Could not import 'mappo_algorithm.py'.")
     exit()
 
-def generate_circular_obstacles(max_radius=3, obstacle_radius=0.12, spacing=1):
+def generate_circular_obstacles(max_radius=3, obstacle_radius=0.1, spacing=1):
     """生成圆形障碍物阵列"""
     obstacles = []
     start_radius = 0.8 
@@ -72,7 +72,7 @@ def get_train_cfg(exp_name, max_iterations):
 def get_cfgs():
     num_drones = 3
     
-    # [NEW] 生成圆形障碍物分布
+    # 生成圆形障碍物分布
     obstacles = generate_circular_obstacles(max_radius=3, obstacle_radius=0.1, spacing=1.0)
     
     env_cfg = {
@@ -82,15 +82,15 @@ def get_cfgs():
         "termination_if_roll_greater_than": 60,
         "termination_if_pitch_greater_than": 60,
         "termination_if_close_to_ground": 0.02,
-        # [NEW] 初始位置：距离圆形区域(R=3.5) 1米，即 x = -4.5 附近
+        # 初始位置：距离圆形区域(R=3.5) 1米，即 x = -4.5 附近
         "drone_init_positions": [
             [-4, -1.5, 1.0], [-4, 0.0, 1.0], [-4, 1.5, 1.0],
         ],
-        # [NEW] 目标位置不再固定，将在 Env 中随机生成，此处留空或作为占位
+        # 目标位置不再固定，将在 Env 中随机生成，此处留空或作为占位
         "drone_goal_positions": [], 
-        "episode_length_s": 50.0, # [NEW] 增加时间以适应 5 轮任务
-        "rounds_per_episode": 5,   # [NEW] 每轮 Episode 需要完成 5 次目标
-        "obstacle_area_radius": 3.51, # [NEW] 障碍物区域半径
+        "episode_length_s": 50.0, 
+        "rounds_per_episode": 5,   # 每轮 Episode 需要完成 5 次目标
+        "obstacle_area_radius": 3, 
         "at_target_threshold": 0.3,
         "simulate_action_latency": True,
         "clip_actions": 1.0,
@@ -104,11 +104,11 @@ def get_cfgs():
         "obstacle_height": 2.5,
         "obstacle_safe_distance": 0.3,
         "obstacle_collision_distance": 0.1,
-        "drone_safe_distance": 0.4,
+        "drone_safe_distance": 1,
         "drone_collision_distance": 0.1,
     }
     
-    # === [UPDATE] 观测维度计算 (CTDE) ===
+    # === 观测维度计算 (CTDE) ===
     # 局部观测 (Actor): 
     # Base(17) + Others(N-1)*(Pos(3)+Mask(1)=4) + Obstacles(K*3)
     num_nearest_obs = env_cfg["num_nearest_obstacles"]
@@ -245,5 +245,5 @@ python multi_drone_mappo_train.py -e multi-drone-mappo -B 8192 --max_iterations 
 python multi_drone_mappo_train.py -e multi-drone-mappo -B 64 --max_iterations 1000 --resume -v
 
 # 6. 微调（加载新配置）
-python multi_drone_mappo_train.py -e multi-drone-mappo -B 8192 --max_iterations 1000 --resume --ckpt 400 --update_config
+python multi_drone_mappo_train.py -e multi-drone-mappo-v2 -B 6000 --max_iterations 2501 --resume --ckpt 1800 --update_config
 """

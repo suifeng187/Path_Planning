@@ -28,7 +28,7 @@ python view_training_params.py -e multi-drone-ppo-v2
 python view_training_params.py -e multi-drone-ppo-v2 --ckpt 1400
 
 # 导出为Markdown格式
-python view_training_params.py -e multi-drone-ppo-v2 --ckpt 1400 --format markdown --output params_1400pt.md
+python view_training_params.py -e multi-drone-mappo-v3 --ckpt 700 --format markdown --output params_1400pt.md
 
 # 导出为JSON格式
 python view_training_params.py -e multi-drone-ppo-v2 --ckpt 1400 --format json --output params_1400pt.json
@@ -141,6 +141,9 @@ python view_training_params.py -e multi-drone-ppo-v2 --ckpt 1400
 # 导出为文档
 python view_training_params.py -e multi-drone-ppo-v2 --ckpt 1400 --format markdown --output params_1400pt.md
 ```
+
+
+
 
 
 

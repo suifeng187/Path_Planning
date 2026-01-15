@@ -220,11 +220,9 @@ class MAPPORunner:
         
         self.ep_infos = deque(maxlen=100)
         
-        # [NEW] 记录当前开始的迭代次数，默认为 0
         self.start_iteration = 0
 
     def learn(self, num_learning_iterations=None, init_at_random_ep_len=False):
-        # 如果未指定，默认训练到 max_iterations
         if num_learning_iterations is None:
             num_learning_iterations = self.max_iterations
 
@@ -233,8 +231,7 @@ class MAPPORunner:
         
         print(f"Starting Training: {num_learning_iterations} iterations (Start from {self.start_iteration})")
         start_time = time.time()
-        
-        # [NEW] 循环从 self.start_iteration 开始
+
         for it in range(self.start_iteration, num_learning_iterations):
             with torch.inference_mode():
                 for step in range(self.num_steps_per_env):
@@ -276,8 +273,6 @@ class MAPPORunner:
                 torch.cuda.empty_cache()
 
             self.log(it, stats, start_time)
-            
-            # 使用 it+1 作为保存的文件名，确保连续性
             if (it + 1) % self.save_interval == 0:
                 self.save(it + 1)
 
@@ -304,7 +299,6 @@ class MAPPORunner:
         mean_rew = self.storage["rewards"].sum() / self.num_envs
         fps = int(self.num_steps_per_env * self.num_envs / (time.time() - start_time + 1e-6))
         
-        # 显示的 Log 是当前实际迭代次数
         log_string = f"Iter {it+1}/{self.max_iterations} | Rew: {mean_rew:.2f} | Loss: {stats['loss/surrogate']:.4f} | KL: {stats['policy/mean_kl']:.4f} | LR: {stats['policy/learning_rate']:.6f} | FPS: {fps}"
         
         if len(self.ep_infos) > 0:
@@ -334,7 +328,7 @@ class MAPPORunner:
         path = os.path.join(self.log_dir, f"model_{it}.pt")
         torch.save({
             'model_state_dict': self.alg.ac.state_dict(),
-            'iteration': it, # 保存当前迭代次数
+            'iteration': it,
             'config': {'num_actor_obs': self.num_actor_obs, 'num_critic_obs': self.num_critic_obs}
         }, path)
         print(f"Model saved: {path}")
@@ -343,7 +337,6 @@ class MAPPORunner:
         checkpoint = torch.load(path, map_location=self.device)
         self.alg.ac.load_state_dict(checkpoint['model_state_dict'])
         
-        # [NEW] 读取保存的迭代次数，以便从此处继续计数
         self.start_iteration = checkpoint.get('iteration', 0)
         
         print(f"Loaded model from {path}, resuming from iter: {self.start_iteration}")
