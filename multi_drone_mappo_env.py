@@ -1,9 +1,8 @@
 """
 多无人机避障路径规划环境 - MAPPO版本 (CTDE架构)
 【修改说明】
-1. 观测空间全部切换为机体坐标系 (Body Frame)。
-2. 友机观测仅保留最近的 1 个，并增加了相对速度和相对姿态。
-3. 自身观测移除了绝对姿态，仅保留机体系下的相对目标位置。
+1. 邻居观测移除四元数 (RelQuat)。
+2. 奖励函数逻辑更新 (Yaw 设为 0)。
 """
 import torch
 import math
@@ -189,7 +188,6 @@ class MultiDroneMAPPOEnv:
         self.base_pos = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
         self.base_quat = torch.zeros((self.num_physical_envs, self.num_drones, 4), device=gs.device, dtype=gs.tc_float)
         
-        # [NEW] 增加 world_lin_vel 用于相对速度计算
         self.world_lin_vel = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
         
         self.base_lin_vel = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float) # 机体系
@@ -369,7 +367,7 @@ class MultiDroneMAPPOEnv:
 
     def _compute_observations(self):
         """
-        全机体坐标系观测 + 仅观测最近1个邻居 + 引入相对速度/姿态
+        全机体坐标系观测 + 仅观测最近1个邻居 + 引入相对速度 + 【修改】移除相对姿态
         """
         obs_list = []
         has_obstacles = self.obstacle_pos_tensor.shape[0] > 0
@@ -384,7 +382,6 @@ class MultiDroneMAPPOEnv:
             rel_pos_target_body = transform_by_quat(self.rel_pos[:, i, :], inv_self_quat)
             
             # 2. 构建自身观测
-            # 移除了绝对姿态 self.base_quat，保留机体系数据
             base_obs = torch.cat([
                 torch.clip(rel_pos_target_body * self.obs_scales["rel_pos"], -1, 1), # (3)
                 torch.clip(self.base_lin_vel[:, i, :] * self.obs_scales["lin_vel"], -1, 1), # (3)
@@ -392,51 +389,47 @@ class MultiDroneMAPPOEnv:
                 self.last_actions_phys[:, i, :], # (4)
             ], dim=-1)
             
-            # --- [B] 友机感知 (最近的 1 个, 11 dims) ---
+            # --- [B] 友机感知 (最近的 1 个, 7 dims) ---
             # 1. 计算与所有其他无人机的距离
             pos_i = self.base_pos[:, i:i+1, :] # (B, 1, 3)
             all_dists = torch.norm(self.base_pos - pos_i, dim=-1) # (B, N)
             
-            # 将自己的距离设为无穷大
             all_dists[:, i] = float('inf')
             
             # 找到最近邻居
             nearest_vals, nearest_idxs = torch.min(all_dists, dim=1) # (B,)
             
-            # 辅助 Gather 函数
             def gather_neighbor(tensor, idxs):
                 return tensor[torch.arange(self.num_physical_envs), idxs]
 
             neigh_pos = gather_neighbor(self.base_pos, nearest_idxs)       # World Pos
             neigh_vel = gather_neighbor(self.world_lin_vel, nearest_idxs) # World Vel
-            neigh_quat = gather_neighbor(self.base_quat, nearest_idxs)    # World Quat
+            # neigh_quat = gather_neighbor(self.base_quat, nearest_idxs)  # [Deleted] 不再需要邻居姿态
             
             # 2. 计算相对量并转机体系
-            # 相对位置 (World -> Body)
             rel_pos_neigh_world = neigh_pos - self.base_pos[:, i, :]
             rel_pos_neigh_body = transform_by_quat(rel_pos_neigh_world, inv_self_quat)
             
-            # 【关键修改】相对速度 (World -> Body)
+            # 相对速度 (World -> Body)
             rel_vel_neigh_world = neigh_vel - self.world_lin_vel[:, i, :]
             rel_vel_neigh_body = transform_by_quat(rel_vel_neigh_world, inv_self_quat)
             
-            # 【关键修改】相对姿态 (意图)
-            # q_rel = q_self_inv * q_neigh
-            rel_quat_neigh = transform_quat_by_quat(inv_self_quat, neigh_quat)
+            # [Deleted] 相对姿态
+            # rel_quat_neigh = transform_quat_by_quat(inv_self_quat, neigh_quat)
             
             # 3. Mask
             mask = (nearest_vals < sensing_radius).float().unsqueeze(-1)
             
             # 4. 拼接邻居观测
-            # Pos(3) + Vel(3) + Quat(4) + Mask(1) = 11 dims
+            # Pos(3) + Vel(3) + Mask(1) = 7 dims (原 11 dims)
             neighbor_obs = torch.cat([
                 torch.clip(rel_pos_neigh_body * self.obs_scales["rel_pos"], -1, 1) * mask,
                 torch.clip(rel_vel_neigh_body * self.obs_scales["lin_vel"], -1, 1) * mask,
-                rel_quat_neigh * mask,
+                # rel_quat_neigh * mask, # [Deleted] 移除四元数
                 mask
             ], dim=-1)
 
-            # --- [C] 障碍物感知 (Top-K, 转机体系) ---
+            # --- [C] 障碍物感知 (Top-K, 转机体系, 保持原样) ---
             nearest_obs_vecs = torch.ones((self.num_physical_envs, self.num_nearest_obstacles * 3), device=gs.device) * 2.0
             
             if has_obstacles:
@@ -457,8 +450,7 @@ class MultiDroneMAPPOEnv:
                 indices_expanded = indices.unsqueeze(-1).expand(-1, -1, 3)
                 topk_vecs_world = torch.gather(vecs_world, 1, indices_expanded)
                 
-                # 【修改】将障碍物向量旋转至机体坐标系
-                # topk_vecs_world: (B, K, 3) -> Body Frame
+                # 将障碍物向量旋转至机体坐标系
                 B, K, _ = topk_vecs_world.shape
                 flat_vecs = topk_vecs_world.view(B * K, 3)
                 flat_quat = inv_self_quat.unsqueeze(1).repeat(1, K, 1).view(B * K, 4)
@@ -478,7 +470,7 @@ class MultiDroneMAPPOEnv:
                     nearest_obs_vecs = flat_obs
 
             # --- [D] 最终拼接 ---
-            # Total = Base(13) + Neighbor(11) + Obstacles(6) = 30
+            # Total = Base(13) + Neighbor(7) + Obstacles(6) = 26
             drone_obs = torch.cat([base_obs, neighbor_obs, nearest_obs_vecs], dim=-1)
             obs_list.append(drone_obs)
         
@@ -582,7 +574,7 @@ class MultiDroneMAPPOEnv:
         dist_reduction = last_dist - curr_dist
         rew = dist_reduction
         drone_at_target = curr_dist < self.env_cfg["at_target_threshold"]
-        rew[drone_at_target] += 0.01
+        rew[drone_at_target] += 0.02
         return rew.flatten()
 
     def _reward_smooth(self):
@@ -592,25 +584,20 @@ class MultiDroneMAPPOEnv:
 
     def _reward_yaw(self):
         """
-        鼓励机头方向(Body X轴)与水平速度方向一致。
+        奖励机头对准速度方向 (相对稳定性)
         """
-        # 1. 获取机体系下的水平速度 (N, D, 3)
-        # base_lin_vel 的 x 分量代表机头方向的速度，y 分量代表侧移速度
+        # 1. 获取水平速度
         vel_xy = self.base_lin_vel[:, :, :2] 
         speed = torch.norm(vel_xy, dim=-1)
         
-        # 2. 计算对齐度
-        # 我们希望 Vx 很大 (接近 Speed)，Vy 很小 (接近 0)
-        # alignment = Vx / Speed. 
-        # 范围 [-1, 1]。1.0 代表完美对齐，0.0 代表侧飞，-1.0 代表倒飞。
+        # 2. 计算对齐度 (Vx / Speed)
+        # 在机体坐标系下，Vx 就是机头方向的速度分量
         alignment = vel_xy[:, :, 0] / (speed + 1e-6)
         
-        # 3. 施加奖励条件
-        # 只有当速度大于一定阈值(如 0.1 m/s)时，对齐才有意义。
-        # 静止时 speed 很小，方向不稳定，不计算奖励。
+        # 3. 只有在移动时才计算 (速度 > 0.1m/s)
         mask_moving = (speed > 0.1).float()
         
-        # 返回对齐度作为奖励
+        # 4. 给正向对齐以奖励
         return (alignment * mask_moving).flatten()
 
     def _reward_angular(self):

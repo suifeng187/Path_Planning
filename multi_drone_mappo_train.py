@@ -1,7 +1,8 @@
 """
 多无人机避障路径规划训练脚本 - MAPPO版本 (圆形障碍物与多轮任务)
 【修改说明】
-1. 更新观测维度计算：适应单邻居、全机体坐标系的 30 维输入。
+1. 邻居观测移除相对姿态，维度降低。
+2. 奖励函数取消 Yaw 约束，鼓励全向飞行。
 """
 import argparse
 import os
@@ -111,20 +112,17 @@ def get_cfgs():
     }
     
     # === 观测维度计算 (CTDE) ===
-    # 【修改】更新为新的观测空间设计
     # 1. Self State (13维): RelPosBody(3) + LinVelBody(3) + AngVelBody(3) + LastAction(4)
-    #    注意：移除了绝对姿态 Quat(4)
     self_dim = 13
     
-    # 2. Neighbor State (11维): RelPosBody(3) + RelVelBody(3) + RelQuat(4) + Mask(1)
-    #    注意：只观测最近的 1 个邻居
-    neighbor_dim = 11
+    # 2. Neighbor State (7维): RelPosBody(3) + RelVelBody(3) + Mask(1)
+    neighbor_dim = 7 
     
     # 3. Obstacle State (6维): K=2 * 3 (Body Frame)
     obstacle_dim = env_cfg["num_nearest_obstacles"] * 3
     
     local_obs_dim = self_dim + neighbor_dim + obstacle_dim
-    # Result: 13 + 11 + 6 = 30 维
+    # Result: 13 + 7 + 6 = 26 维
     
     # 全局观测 (Critic): 拼接所有 Agent 的局部观测
     global_obs_dim = local_obs_dim * num_drones
@@ -148,8 +146,8 @@ def get_cfgs():
             "progress": 1,     
             "alive": 0,
             "smooth": -0.01,
-            "yaw": 0.1,
-            "angular": -0.05,
+            "yaw": 0.5,          
+            "angular": -0.05,    
             "crash": -50.0,
             "obstacle": -5.0,
             "separation": -5.0,
