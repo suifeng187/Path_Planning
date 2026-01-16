@@ -1,5 +1,7 @@
 """
 多无人机避障路径规划训练脚本 - MAPPO版本 (圆形障碍物与多轮任务)
+【修改说明】
+1. 更新观测维度计算：适应单邻居、全机体坐标系的 30 维输入。
 """
 import argparse
 import os
@@ -104,15 +106,25 @@ def get_cfgs():
         "obstacle_height": 2.5,
         "obstacle_safe_distance": 0.3,
         "obstacle_collision_distance": 0.1,
-        "drone_safe_distance": 1,
+        "drone_safe_distance": 0.4,
         "drone_collision_distance": 0.1,
     }
     
     # === 观测维度计算 (CTDE) ===
-    # 局部观测 (Actor): 
-    # Base(17) + Others(N-1)*(Pos(3)+Mask(1)=4) + Obstacles(K*3)
-    num_nearest_obs = env_cfg["num_nearest_obstacles"]
-    local_obs_dim = 17 + (num_drones - 1) * 4 + (num_nearest_obs * 3)
+    # 【修改】更新为新的观测空间设计
+    # 1. Self State (13维): RelPosBody(3) + LinVelBody(3) + AngVelBody(3) + LastAction(4)
+    #    注意：移除了绝对姿态 Quat(4)
+    self_dim = 13
+    
+    # 2. Neighbor State (11维): RelPosBody(3) + RelVelBody(3) + RelQuat(4) + Mask(1)
+    #    注意：只观测最近的 1 个邻居
+    neighbor_dim = 11
+    
+    # 3. Obstacle State (6维): K=2 * 3 (Body Frame)
+    obstacle_dim = env_cfg["num_nearest_obstacles"] * 3
+    
+    local_obs_dim = self_dim + neighbor_dim + obstacle_dim
+    # Result: 13 + 11 + 6 = 30 维
     
     # 全局观测 (Critic): 拼接所有 Agent 的局部观测
     global_obs_dim = local_obs_dim * num_drones
@@ -136,10 +148,10 @@ def get_cfgs():
             "progress": 1,     
             "alive": 0,
             "smooth": -0.01,
-            "yaw": 0.2,
+            "yaw": 0.1,
             "angular": -0.05,
-            "crash": -30.0,
-            "obstacle": -6.0,
+            "crash": -50.0,
+            "obstacle": -5.0,
             "separation": -5.0,
             "team_coordination": 0.2,
         },
@@ -230,7 +242,7 @@ if __name__ == "__main__":
 # MAPPO多无人机训练命令
 
 # 1. 新训练（无可视化，快速训练）
-python multi_drone_mappo_train.py -e multi-drone-mappo-v2 -B 4096 --max_iterations 800
+python multi_drone_mappo_train.py -e multi-drone-mappo-v4 -B 4096 --max_iterations 800
 
 # 2. 新训练（带可视化）
 python multi_drone_mappo_train.py -e multi-drone-mappo -B 64 --max_iterations 800 -v

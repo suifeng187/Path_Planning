@@ -1,9 +1,7 @@
 """
-多无人机避障路径规划环境 - MAPPO版本 (CTDE架构)
-【修改说明】
-1. 观测空间全部切换为机体坐标系 (Body Frame)。
-2. 友机观测仅保留最近的 1 个，并增加了相对速度和相对姿态。
-3. 自身观测移除了绝对姿态，仅保留机体系下的相对目标位置。
+multi_drone_mappo_forest_env.py
+多无人机避障路径规划环境 - MAPPO版本
+更新内容：支持固定目标点 (Fixed Targets) 和 指定轮次结束 (Round Termination)
 """
 import torch
 import math
@@ -27,7 +25,7 @@ class MultiDroneMAPPOEnv:
         self.rendered_env_num = min(5, self.num_physical_envs)
         
         # 观测维度配置
-        self.num_obs_per_drone = obs_cfg["num_obs_per_drone"] # Actor 输入维度
+        self.num_obs_per_drone = obs_cfg["num_obs_per_drone"] 
         self.num_obs = self.num_obs_per_drone
         
         # 特权观测维度 (Critic 输入)
@@ -44,15 +42,15 @@ class MultiDroneMAPPOEnv:
         self.obs_scales = obs_cfg["obs_scales"]
         self.reward_scales = copy.deepcopy(reward_cfg["reward_scales"])
         
-        # 团队奖励系数 (0.0: 完全自私, 1.0: 完全平均)
         self.team_spirit = env_cfg.get("team_spirit", 0.3) 
-        
         self.sensing_radius = env_cfg.get("sensing_radius", 3.0)
         self.num_nearest_obstacles = env_cfg.get("num_nearest_obstacles", 2)
 
-        # 轮次控制参数
+        # [关键] 轮次控制：默认为5，评估时通常设为1
         self.rounds_per_ep = env_cfg.get("rounds_per_episode", 5)
         self.obstacle_area_radius = env_cfg.get("obstacle_area_radius", 3.5)
+        
+        # 记录每个环境完成的轮数
         self.success_rounds = torch.zeros(self.num_physical_envs, device=self.device, dtype=torch.long)
 
         # ==================== 创建仿真场景 ====================
@@ -152,13 +150,21 @@ class MultiDroneMAPPOEnv:
                 self.target_entities.append(entity)
 
         if env_cfg.get("visualize_camera", False):
-            camera_height = 8.0
+            camera_height = 12.0  # 保持高度不变
             lookat_height = 0.8
-            tilt_angle_rad = math.radians(20) 
+            tilt_angle_rad = math.radians(20)
+            
+            # 计算水平偏移量
             horizontal_offset = (camera_height - lookat_height) * math.tan(tilt_angle_rad)
+            
             self.cam = self.scene.add_camera(
-                res=(1280, 720), 
-                pos=(horizontal_offset, 0.0, camera_height), 
+                res=(1280, 720),
+                # 【修改点】: 
+                # 原来是 (horizontal_offset, 0.0, camera_height) -> 这是从跑道头/尾看
+                # 现在改 (0.0, horizontal_offset, camera_height) -> 这是从侧面看
+                # 或者   (0.0, -horizontal_offset, camera_height)
+                pos=(0.0, -horizontal_offset, camera_height), 
+                
                 lookat=(0.0, 0.0, lookat_height), 
                 fov=50, 
                 GUI=False,
@@ -168,7 +174,7 @@ class MultiDroneMAPPOEnv:
 
         self.scene.build(n_envs=self.num_physical_envs)
 
-        # ==================== 初始化 ====================
+        # ==================== 初始化 Buffer ====================
         self.reward_functions, self.episode_sums = dict(), dict()
         for name in self.reward_scales.keys():
             self.reward_scales[name] *= self.dt
@@ -188,12 +194,8 @@ class MultiDroneMAPPOEnv:
 
         self.base_pos = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
         self.base_quat = torch.zeros((self.num_physical_envs, self.num_drones, 4), device=gs.device, dtype=gs.tc_float)
-        
-        # [NEW] 增加 world_lin_vel 用于相对速度计算
-        self.world_lin_vel = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
-        
-        self.base_lin_vel = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float) # 机体系
-        self.base_ang_vel = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float) # 机体系
+        self.base_lin_vel = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
+        self.base_ang_vel = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
         self.base_euler = torch.zeros((self.num_physical_envs, self.num_drones, 3), device=gs.device, dtype=gs.tc_float)
         
         self.last_base_pos = torch.zeros_like(self.base_pos)
@@ -210,51 +212,69 @@ class MultiDroneMAPPOEnv:
         self.extras["observations"] = dict()
 
     def _resample_commands(self, physical_envs_idx):
+        """
+        生成目标点
+        逻辑：如果 env_cfg 中存在 'fixed_target_positions'，则强制使用固定目标；否则使用随机生成（用于训练）。
+        """
         num_resample = len(physical_envs_idx)
-        if num_resample == 0: return
-
-        has_obstacles = self.obstacle_pos_tensor.shape[0] > 0
-        obstacle_radius = self.obstacles[0]["radius"] if has_obstacles else 0.1
-        safe_threshold = obstacle_radius + 0.3 
-
-        x = torch.zeros((num_resample, self.num_drones), device=self.device)
-        y = torch.zeros((num_resample, self.num_drones), device=self.device)
-        z = torch.ones((num_resample, self.num_drones), device=self.device) * 0.8 
-
-        to_generate = torch.ones((num_resample, self.num_drones), dtype=torch.bool, device=self.device)
-        
-        for _ in range(20):
-            if not to_generate.any(): break
-            num_gen = to_generate.sum()
-            r = torch.sqrt(torch.rand(num_gen, device=self.device)) * (self.obstacle_area_radius - 0.3)
-            theta = torch.rand(num_gen, device=self.device) * 2 * math.pi
-            x[to_generate] = r * torch.cos(theta)
-            y[to_generate] = r * torch.sin(theta)
-
-            if not has_obstacles: break
-
-            curr_targets = torch.stack([x[to_generate], y[to_generate]], dim=-1)
-            obs_xy = self.obstacle_pos_tensor[:, :2]
-            dists = torch.cdist(curr_targets, obs_xy)
-            min_dists, _ = dists.min(dim=1)
-            collisions = min_dists < safe_threshold
+        if num_resample == 0:
+            return
             
-            indices = torch.nonzero(to_generate, as_tuple=True)
-            update_mask = torch.zeros_like(to_generate)
-            update_mask[indices] = collisions
-            to_generate = update_mask
+        # === 模式1: 固定目标点 (用于评估) ===
+        if "fixed_target_positions" in self.env_cfg:
+            fixed_targets = torch.tensor(self.env_cfg["fixed_target_positions"], device=self.device, dtype=gs.tc_float)
+            # 将固定目标复制给所有需要重置的环境
+            self.commands[physical_envs_idx] = fixed_targets.unsqueeze(0).expand(num_resample, -1, -1)
+        
+        # === 模式2: 随机生成 (用于训练) ===
+        else:
+            has_obstacles = self.obstacle_pos_tensor.shape[0] > 0
+            obstacle_radius = self.obstacles[0]["radius"] if has_obstacles else 0.1
+            safe_threshold = obstacle_radius + 0.3
 
-        self.commands[physical_envs_idx, :, 0] = x
-        self.commands[physical_envs_idx, :, 1] = y
-        self.commands[physical_envs_idx, :, 2] = z
+            x = torch.zeros((num_resample, self.num_drones), device=self.device)
+            y = torch.zeros((num_resample, self.num_drones), device=self.device)
+            z = torch.ones((num_resample, self.num_drones), device=self.device) * 0.8 
 
+            to_generate = torch.ones((num_resample, self.num_drones), dtype=torch.bool, device=self.device)
+            
+            for _ in range(20): # 尝试20次拒绝采样
+                if not to_generate.any():
+                    break
+
+                num_gen = to_generate.sum()
+                r = torch.sqrt(torch.rand(num_gen, device=self.device)) * (self.obstacle_area_radius - 0.3)
+                theta = torch.rand(num_gen, device=self.device) * 2 * math.pi
+                
+                x[to_generate] = r * torch.cos(theta)
+                y[to_generate] = r * torch.sin(theta)
+
+                if not has_obstacles:
+                    break
+
+                curr_targets = torch.stack([x[to_generate], y[to_generate]], dim=-1)
+                obs_xy = self.obstacle_pos_tensor[:, :2]
+                dists = torch.cdist(curr_targets, obs_xy)
+                min_dists, _ = dists.min(dim=1)
+                collisions = min_dists < safe_threshold
+                
+                indices = torch.nonzero(to_generate, as_tuple=True)
+                update_mask = torch.zeros_like(to_generate)
+                update_mask[indices] = collisions
+                to_generate = update_mask
+
+            self.commands[physical_envs_idx, :, 0] = x
+            self.commands[physical_envs_idx, :, 1] = y
+            self.commands[physical_envs_idx, :, 2] = z
+
+        # 更新相对位置
         current_pos = self.base_pos[physical_envs_idx]
         new_targets = self.commands[physical_envs_idx]
         new_rel_vec = new_targets - current_pos
-        
         self.rel_pos[physical_envs_idx] = new_rel_vec
         self.last_rel_pos[physical_envs_idx] = new_rel_vec
 
+        # 更新可视化目标实体 (如果有)
         if self.env_cfg.get("visualize_target", False) and self.rendered_env_num > 0:
             for env_idx in physical_envs_idx:
                 if env_idx < self.rendered_env_num:
@@ -264,20 +284,26 @@ class MultiDroneMAPPOEnv:
                             self.target_entities[i].set_pos(target_pos, envs_idx=[env_idx.item()])
 
     def step(self, actions):
+        # 0. 清理上一帧的 extras
         self.extras = {}
+        
+        # 1. 动作处理
         actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
         phys_actions = actions.view(self.num_physical_envs, self.num_drones, self.num_actions)
         
         self.prev_actions_phys[:] = self.last_actions_phys[:]
         self.last_actions_phys[:] = phys_actions[:] 
         
+        # 2. 物理步进
         for i, drone in enumerate(self.drones):
             drone_actions = phys_actions[:, i, :]
+            # 简单动力学模型
             drone.set_propellels_rpm((1 + drone_actions * 0.4) * 14468.429183500699)
 
         self.scene.step()
         self.episode_length_buf += 1
 
+        # 3. 更新状态
         self.last_base_pos[:] = self.base_pos[:]
         for i, drone in enumerate(self.drones):
             self.base_pos[:, i, :] = drone.get_pos()
@@ -288,14 +314,8 @@ class MultiDroneMAPPOEnv:
                     self.base_quat[:, i, :],
                 ), rpy=True, degrees=True,
             )
-            
-            # [NEW] 记录世界系速度
-            vel_world = drone.get_vel()
-            self.world_lin_vel[:, i, :] = vel_world
-            
-            # 记录机体系速度
             inv_quat_i = inv_quat(self.base_quat[:, i, :])
-            self.base_lin_vel[:, i, :] = transform_by_quat(vel_world, inv_quat_i)
+            self.base_lin_vel[:, i, :] = transform_by_quat(drone.get_vel(), inv_quat_i)
             self.base_ang_vel[:, i, :] = transform_by_quat(drone.get_ang(), inv_quat_i)
 
         self.last_rel_pos[:] = self.rel_pos[:]
@@ -304,6 +324,7 @@ class MultiDroneMAPPOEnv:
         self.min_obstacle_dist = self._get_min_obstacle_distance()
         self.min_drone_dist = self._get_min_drone_distance()
 
+        # 5. 终止条件判定
         phys_crash_any = torch.zeros((self.num_physical_envs,), device=gs.device, dtype=torch.bool)
         drone_collision_per_drone = self.min_drone_dist < self.env_cfg.get("drone_collision_distance", 0.3)
         phys_collision_any = drone_collision_per_drone.any(dim=1)
@@ -316,26 +337,42 @@ class MultiDroneMAPPOEnv:
                 | (self.min_obstacle_dist[:, i] < self.obstacle_collision_distance)
             )
             phys_crash_any = phys_crash_any | drone_crash
-            drone_success = torch.norm(self.rel_pos[:, i, :], dim=1) < self.env_cfg["at_target_threshold"]
+            # 判断是否到达目标
+            drone_success = torch.norm(self.rel_pos[:, i, :], dim=1) < self.env_cfg["at_target_threshold"] + 0.1
             self.drone_ever_reached_target[:, i] = self.drone_ever_reached_target[:, i] | drone_success
 
         phys_crash_any = phys_crash_any | phys_collision_any
-        phys_success_all = torch.all(self.drone_ever_reached_target, dim=1)
+        phys_success_all = torch.all(self.drone_ever_reached_target, dim=1) # 这一帧是否所有无人机都到达过目标
         
+        # ================= [关键修改] 处理多轮目标逻辑 =================
+        # 找出本帧完成任务的环境
         env_ids_success = phys_success_all.nonzero(as_tuple=False).flatten()
+        
         if len(env_ids_success) > 0:
+            # 增加成功轮数
             self.success_rounds[env_ids_success] += 1
+
+            # 检查是否完成了所有轮次 (评估模式下 rounds_per_ep = 1)
             is_episode_done = self.success_rounds[env_ids_success] >= self.rounds_per_ep
+            
+            # 如果还没达到指定轮数，则进入下一轮
             env_ids_next_round = env_ids_success[~is_episode_done]
             
             if len(env_ids_next_round) > 0:
+                # 1. 刷新这些环境的目标点
                 self._resample_commands(env_ids_next_round)
+                # 2. 清除到达标志
                 self.drone_ever_reached_target[env_ids_next_round] = False
+                # 3. 强制把 phys_success_all 置为 False，防止触发下面的 reset_idx
                 phys_success_all[env_ids_next_round] = False
+            
+            # 如果 is_episode_done 为 True，phys_success_all 保持为 True，
+            # 下面的 Reset 逻辑会捕捉到它，并将其视为整个 Episode 成功结束。
 
         self.phys_crash_cond = phys_crash_any
         self.phys_success_cond = phys_success_all
         
+        # 6. 计算奖励
         self.rew_buf[:] = 0.0
         raw_rewards = torch.zeros((self.num_physical_envs, self.num_drones), device=gs.device)
         
@@ -346,12 +383,13 @@ class MultiDroneMAPPOEnv:
             self.episode_sums[name] += rew
 
         if self.team_spirit > 0:
-            team_mean_reward = raw_rewards.mean(dim=1, keepdim=True)
+            team_mean_reward = raw_rewards.mean(dim=1, keepdim=True) 
             final_rewards = (1.0 - self.team_spirit) * raw_rewards + self.team_spirit * team_mean_reward
             self.rew_buf = final_rewards.flatten()
         else:
             self.rew_buf = raw_rewards.flatten()
 
+        # 7. 处理 Reset (崩溃、成功、超时)
         phys_time_out = self.episode_length_buf.view(self.num_physical_envs, self.num_drones)[:, 0] >= self.max_episode_length
         phys_reset = phys_crash_any | phys_success_all | phys_time_out
         
@@ -360,6 +398,7 @@ class MultiDroneMAPPOEnv:
         if len(env_ids_to_reset) > 0:
             self.reset_idx(env_ids_to_reset)
 
+        # 8. 计算观测
         self._compute_observations()
         
         self.extras["privileged_obs"] = self.privileged_obs_buf
@@ -368,85 +407,40 @@ class MultiDroneMAPPOEnv:
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
 
     def _compute_observations(self):
-        """
-        全机体坐标系观测 + 仅观测最近1个邻居 + 引入相对速度/姿态
-        """
         obs_list = []
         has_obstacles = self.obstacle_pos_tensor.shape[0] > 0
         sensing_radius = self.sensing_radius
         
         for i in range(self.num_drones):
-            # 获取自身逆姿态 (World -> Body)
-            inv_self_quat = inv_quat(self.base_quat[:, i, :])
-            
-            # --- [A] 自身状态 (13 dims) ---
-            # 1. 目标位置转机体系
-            rel_pos_target_body = transform_by_quat(self.rel_pos[:, i, :], inv_self_quat)
-            
-            # 2. 构建自身观测
-            # 移除了绝对姿态 self.base_quat，保留机体系数据
+            # 基础信息
             base_obs = torch.cat([
-                torch.clip(rel_pos_target_body * self.obs_scales["rel_pos"], -1, 1), # (3)
-                torch.clip(self.base_lin_vel[:, i, :] * self.obs_scales["lin_vel"], -1, 1), # (3)
-                torch.clip(self.base_ang_vel[:, i, :] * self.obs_scales["ang_vel"], -1, 1), # (3)
-                self.last_actions_phys[:, i, :], # (4)
+                torch.clip(self.rel_pos[:, i, :] * self.obs_scales["rel_pos"], -1, 1),
+                self.base_quat[:, i, :],
+                torch.clip(self.base_lin_vel[:, i, :] * self.obs_scales["lin_vel"], -1, 1),
+                torch.clip(self.base_ang_vel[:, i, :] * self.obs_scales["ang_vel"], -1, 1),
+                self.last_actions_phys[:, i, :],
             ], dim=-1)
             
-            # --- [B] 友机感知 (最近的 1 个, 11 dims) ---
-            # 1. 计算与所有其他无人机的距离
-            pos_i = self.base_pos[:, i:i+1, :] # (B, 1, 3)
-            all_dists = torch.norm(self.base_pos - pos_i, dim=-1) # (B, N)
+            # 队友感知
+            other_drones_obs = []
+            for j in range(self.num_drones):
+                if i != j:
+                    rel_vec = self.base_pos[:, j, :] - self.base_pos[:, i, :]
+                    dist = torch.norm(rel_vec, dim=1, keepdim=True)
+                    mask = (dist < sensing_radius).float()
+                    scaled_rel = torch.clip(rel_vec * self.obs_scales["rel_pos"], -1, 1)
+                    masked_rel_pos = scaled_rel * mask
+                    obs_with_flag = torch.cat([masked_rel_pos, mask], dim=-1)
+                    other_drones_obs.append(obs_with_flag)
             
-            # 将自己的距离设为无穷大
-            all_dists[:, i] = float('inf')
-            
-            # 找到最近邻居
-            nearest_vals, nearest_idxs = torch.min(all_dists, dim=1) # (B,)
-            
-            # 辅助 Gather 函数
-            def gather_neighbor(tensor, idxs):
-                return tensor[torch.arange(self.num_physical_envs), idxs]
-
-            neigh_pos = gather_neighbor(self.base_pos, nearest_idxs)       # World Pos
-            neigh_vel = gather_neighbor(self.world_lin_vel, nearest_idxs) # World Vel
-            neigh_quat = gather_neighbor(self.base_quat, nearest_idxs)    # World Quat
-            
-            # 2. 计算相对量并转机体系
-            # 相对位置 (World -> Body)
-            rel_pos_neigh_world = neigh_pos - self.base_pos[:, i, :]
-            rel_pos_neigh_body = transform_by_quat(rel_pos_neigh_world, inv_self_quat)
-            
-            # 【关键修改】相对速度 (World -> Body)
-            rel_vel_neigh_world = neigh_vel - self.world_lin_vel[:, i, :]
-            rel_vel_neigh_body = transform_by_quat(rel_vel_neigh_world, inv_self_quat)
-            
-            # 【关键修改】相对姿态 (意图)
-            # q_rel = q_self_inv * q_neigh
-            rel_quat_neigh = transform_quat_by_quat(inv_self_quat, neigh_quat)
-            
-            # 3. Mask
-            mask = (nearest_vals < sensing_radius).float().unsqueeze(-1)
-            
-            # 4. 拼接邻居观测
-            # Pos(3) + Vel(3) + Quat(4) + Mask(1) = 11 dims
-            neighbor_obs = torch.cat([
-                torch.clip(rel_pos_neigh_body * self.obs_scales["rel_pos"], -1, 1) * mask,
-                torch.clip(rel_vel_neigh_body * self.obs_scales["lin_vel"], -1, 1) * mask,
-                rel_quat_neigh * mask,
-                mask
-            ], dim=-1)
-
-            # --- [C] 障碍物感知 (Top-K, 转机体系) ---
+            # 障碍物感知
             nearest_obs_vecs = torch.ones((self.num_physical_envs, self.num_nearest_obstacles * 3), device=gs.device) * 2.0
-            
             if has_obstacles:
                 curr_drone_pos = self.base_pos[:, i, :]
                 obs_pos_expanded = self.obstacle_pos_tensor.unsqueeze(0).expand(self.num_physical_envs, -1, -1).clone()
                 obs_pos_expanded[:, :, 2] = curr_drone_pos[:, 2].unsqueeze(1) 
-                
-                # 世界系差值
-                vecs_world = obs_pos_expanded - curr_drone_pos.unsqueeze(1) 
-                dists = torch.norm(vecs_world, dim=-1) 
+                vecs = obs_pos_expanded - curr_drone_pos.unsqueeze(1) 
+                dists = torch.norm(vecs, dim=-1) 
                 
                 out_of_range_mask = dists > sensing_radius
                 dists_masked = dists.clone()
@@ -455,39 +449,24 @@ class MultiDroneMAPPOEnv:
                 k = min(self.num_nearest_obstacles, self.obstacle_pos_tensor.shape[0])
                 sorted_dists, indices = torch.topk(dists_masked, k, dim=1, largest=False)
                 indices_expanded = indices.unsqueeze(-1).expand(-1, -1, 3)
-                topk_vecs_world = torch.gather(vecs_world, 1, indices_expanded)
+                topk_vecs = torch.gather(vecs, 1, indices_expanded)
+                topk_vecs = torch.clip(topk_vecs * self.obs_scales["obstacle"], -1, 1)
                 
-                # 【修改】将障碍物向量旋转至机体坐标系
-                # topk_vecs_world: (B, K, 3) -> Body Frame
-                B, K, _ = topk_vecs_world.shape
-                flat_vecs = topk_vecs_world.view(B * K, 3)
-                flat_quat = inv_self_quat.unsqueeze(1).repeat(1, K, 1).view(B * K, 4)
-                
-                flat_vecs_body = transform_by_quat(flat_vecs, flat_quat)
-                topk_vecs_body = flat_vecs_body.view(B, K, 3)
-                
-                # 裁剪与 Mask
-                topk_vecs_body = torch.clip(topk_vecs_body * self.obs_scales["obstacle"], -1, 1)
                 valid_mask = (sorted_dists < sensing_radius).unsqueeze(-1).float()
-                
-                final_vecs = topk_vecs_body * valid_mask + 2.0 * (1.0 - valid_mask)
+                final_vecs = topk_vecs * valid_mask + 2.0 * (1.0 - valid_mask)
                 flat_obs = final_vecs.reshape(self.num_physical_envs, -1)
                 if k < self.num_nearest_obstacles:
                     nearest_obs_vecs[:, :k*3] = flat_obs
                 else:
                     nearest_obs_vecs = flat_obs
 
-            # --- [D] 最终拼接 ---
-            # Total = Base(13) + Neighbor(11) + Obstacles(6) = 30
-            drone_obs = torch.cat([base_obs, neighbor_obs, nearest_obs_vecs], dim=-1)
+            drone_obs = torch.cat([base_obs] + other_drones_obs + [nearest_obs_vecs], dim=-1)
             obs_list.append(drone_obs)
         
-        # 整理 Buffer
         stacked_local_obs = torch.stack(obs_list, dim=0) 
-        permuted_local_obs = stacked_local_obs.permute(1, 0, 2)
+        permuted_local_obs = stacked_local_obs.permute(1, 0, 2) 
         self.obs_buf = permuted_local_obs.reshape(self.num_envs, self.num_obs)
         
-        # Critic 观测
         global_state = stacked_local_obs.permute(1, 0, 2).reshape(self.num_physical_envs, -1)
         global_state_expanded = global_state.unsqueeze(1).expand(-1, self.num_drones, -1)
         self.privileged_obs_buf = global_state_expanded.reshape(self.num_envs, self.num_privileged_obs)
@@ -542,7 +521,6 @@ class MultiDroneMAPPOEnv:
 
         self.base_lin_vel[phys_env_ids] = 0
         self.base_ang_vel[phys_env_ids] = 0
-        self.world_lin_vel[phys_env_ids] = 0 # reset world vel
         self.last_actions_phys[phys_env_ids] = 0.0
         self.prev_actions_phys[phys_env_ids] = 0.0
         
@@ -559,6 +537,7 @@ class MultiDroneMAPPOEnv:
         self.min_obstacle_dist[phys_env_ids] = 10.0
         self.min_drone_dist[phys_env_ids] = 10.0
         
+        # [重要] 重置成功轮数
         self.success_rounds[phys_env_ids] = 0
 
         self.extras["episode"] = {}
@@ -575,14 +554,13 @@ class MultiDroneMAPPOEnv:
         self.reset_idx(torch.arange(self.num_envs, device=gs.device))
         return self.obs_buf, self.privileged_obs_buf
 
-    # ==================== 奖励函数 ====================
+    # ==================== 奖励函数定义 ====================
     def _reward_target(self):
         curr_dist = torch.norm(self.rel_pos, dim=2)
         last_dist = torch.norm(self.last_rel_pos, dim=2)
-        dist_reduction = last_dist - curr_dist
-        rew = dist_reduction
+        rew = last_dist - curr_dist
         drone_at_target = curr_dist < self.env_cfg["at_target_threshold"]
-        rew[drone_at_target] += 0.01
+        rew[drone_at_target] += 0.1
         return rew.flatten()
 
     def _reward_smooth(self):
@@ -591,27 +569,10 @@ class MultiDroneMAPPOEnv:
         return -smooth_penalty.flatten()
 
     def _reward_yaw(self):
-        """
-        鼓励机头方向(Body X轴)与水平速度方向一致。
-        """
-        # 1. 获取机体系下的水平速度 (N, D, 3)
-        # base_lin_vel 的 x 分量代表机头方向的速度，y 分量代表侧移速度
-        vel_xy = self.base_lin_vel[:, :, :2] 
-        speed = torch.norm(vel_xy, dim=-1)
-        
-        # 2. 计算对齐度
-        # 我们希望 Vx 很大 (接近 Speed)，Vy 很小 (接近 0)
-        # alignment = Vx / Speed. 
-        # 范围 [-1, 1]。1.0 代表完美对齐，0.0 代表侧飞，-1.0 代表倒飞。
-        alignment = vel_xy[:, :, 0] / (speed + 1e-6)
-        
-        # 3. 施加奖励条件
-        # 只有当速度大于一定阈值(如 0.1 m/s)时，对齐才有意义。
-        # 静止时 speed 很小，方向不稳定，不计算奖励。
-        mask_moving = (speed > 0.1).float()
-        
-        # 返回对齐度作为奖励
-        return (alignment * mask_moving).flatten()
+        yaw = self.base_euler[:, :, 2]
+        yaw = torch.where(yaw > 180, yaw - 360, yaw) / 180 * 3.14159
+        yaw_rew = torch.exp(self.reward_cfg["yaw_lambda"] * torch.abs(yaw))
+        return yaw_rew.flatten()
 
     def _reward_angular(self):
         angular_rew = torch.norm(self.base_ang_vel / 3.14159, dim=2)
@@ -656,8 +617,8 @@ class MultiDroneMAPPOEnv:
 
     def _reward_team_coordination(self):
         dists = torch.norm(self.rel_pos, dim=2)
-        max_dist, _ = torch.max(dists, dim=1) 
-        scale_factor = 6.0
+        max_dist, _ = torch.max(dists, dim=1)
+        scale_factor = 10 #接近场地长度
         penalty = torch.tanh(max_dist / scale_factor)
         rew = -penalty
         return rew.unsqueeze(1).expand(-1, self.num_drones).flatten()

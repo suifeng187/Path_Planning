@@ -312,7 +312,7 @@ class MAPPORunner:
                         ep_stats[k] = mean_val
                         self.writer.add_scalar(f"Episode/{k}", mean_val, it)
             
-            core_keys = ["rew_target", "rew_progress", "rew_crash", "rew_obstacle","rew_team_coordination"]
+            core_keys = ["rew_target", "rew_progress", "rew_crash", "rew_obstacle","rew_team_coordination", "rew_yaw"]
             for k in core_keys:
                 if k in ep_stats:
                     log_string += f" | {k[4:]}: {ep_stats[k]:.4f}"
